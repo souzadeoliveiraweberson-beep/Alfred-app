@@ -2,6 +2,7 @@ package com.example.data.remote
 
 import android.graphics.Bitmap
 import android.util.Log
+import com.example.BuildConfig
 import com.example.data.model.AlfredChatMessage
 import com.example.data.model.ChatSender
 import com.example.data.model.FinanceScope
@@ -9,20 +10,27 @@ import com.example.data.model.TransactionType
 import com.google.firebase.Firebase
 import com.google.firebase.ai.GenerativeModel
 import com.google.firebase.ai.ai
+import com.google.firebase.ai.type.RequestOptions
 import com.google.firebase.ai.type.Schema
+import com.google.firebase.ai.type.ThinkingLevel
 import com.google.firebase.ai.type.content
 import com.google.firebase.ai.type.generationConfig
+import com.google.firebase.ai.type.thinkingConfig
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.withTimeout
+import org.json.JSONArray
 import org.json.JSONObject
 import java.text.Normalizer
+import java.time.ZoneId
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 
-data class AlfredParsedResponse(
+data class AlfredParsedAction(
     val intent: String,
-    val replyText: String,
     val scope: FinanceScope,
     val transactionType: TransactionType,
     val title: String,
@@ -31,19 +39,28 @@ data class AlfredParsedResponse(
     val accountName: String,
     val isPaid: Boolean,
     val dueDateText: String,
+    val dueAtIso: String,
+    val recurrence: String,
     val actionSummary: String,
+)
+
+data class AlfredMultiActionResponse(
+    val replyText: String,
+    val actions: List<AlfredParsedAction>,
+)
+
+data class AlfredStreamChunk(
+    val accumulatedText: String,
+    val firstTokenLatencyMs: Long,
 )
 
 class AlfredAiService {
 
-    private val commandSchema = Schema.obj(
+    private val actionItemSchema = Schema.obj(
         properties = mapOf(
             "intent" to Schema.enumeration(
-                values = listOf("CREATE_TRANSACTION", "CREATE_REMINDER", "CREATE_GOAL", "QUERY_OR_CHAT"),
-                description = "Intenção financeira principal do comando do usuário"
-            ),
-            "replyText" to Schema.string(
-                description = "Resposta educada, clara e objetiva do mordomo Alfred em português do Brasil"
+                values = listOf("CREATE_TRANSACTION", "CREATE_REMINDER", "CREATE_GOAL", "CONTRIBUTE_GOAL"),
+                description = "Tipo da ação financeira a executar"
             ),
             "scope" to Schema.enumeration(
                 values = listOf("PERSONAL", "BUSINESS"),
@@ -54,13 +71,13 @@ class AlfredAiService {
                 description = "INCOME para receitas/vendas/entradas; EXPENSE para gastos/custos/compras"
             ),
             "title" to Schema.string(
-                description = "Título curto do lançamento, lembrete ou meta"
+                description = "Título curto do lançamento, lembrete ou nome da meta (para CONTRIBUTE_GOAL, o nome da meta citada)"
             ),
             "category" to Schema.string(
                 description = "Categoria curta em português (ex: Alimentação, Transporte, Moradia, Vendas, Serviços, Impostos, Software)"
             ),
             "amount" to Schema.double(
-                description = "Valor numérico em Reais (BRL), 0.0 se não houver valor"
+                description = "Valor numérico positivo em Reais (BRL), ou 0.0 se não houver valor"
             ),
             "accountName" to Schema.string(
                 description = "Conta ou cartão citado (ex: Cartão Principal, Nubank, Conta PJ, Caixa), ou Carteira"
@@ -69,13 +86,32 @@ class AlfredAiService {
                 description = "true se já foi pago ou recebido; false se for conta a pagar ou a receber"
             ),
             "dueDateText" to Schema.string(
-                description = "Data/hora legível para lembretes (ex: Amanhã, 14:00)"
+                description = "Data/hora legível curta para lembretes (ex: Amanhã, 14:00)"
+            ),
+            "dueAtIso" to Schema.string(
+                description = "Data e hora exata em ISO-8601 com fuso do usuário (ex: 2026-11-17T14:00:00-03:00). Se sem hora, use 09:00."
+            ),
+            "recurrence" to Schema.enumeration(
+                values = listOf("NONE", "DAILY", "WEEKLY", "MONTHLY"),
+                description = "Recorrência do lembrete: NONE para único, DAILY diário, WEEKLY semanal, MONTHLY mensal"
             ),
             "actionSummary" to Schema.string(
-                description = "Resumo compacto da ação criada ou string vazia se for apenas conversa"
+                description = "Resumo curto opcional da ação"
             ),
         ),
-        optionalProperties = listOf("dueDateText", "actionSummary")
+        optionalProperties = listOf("dueDateText", "dueAtIso", "recurrence", "actionSummary")
+    )
+
+    private val commandSchema = Schema.obj(
+        properties = mapOf(
+            "replyText" to Schema.string(
+                description = "Resposta educada, clara e objetiva do mordomo Alfred em português do Brasil cobrindo todas as ações."
+            ),
+            "actions" to Schema.array(
+                items = actionItemSchema,
+                description = "Lista de ações financeiras identificadas na mensagem (vazia se for apenas conversa ou dúvida)."
+            ),
+        )
     )
 
     private val conversationalSystemInstruction = content {
@@ -89,6 +125,7 @@ class AlfredAiService {
             3. Análise dos dados reais do usuário fornecidos no contexto (saldos, receitas, despesas, categorias, contas, lembretes e metas).
 
             Regras importantes:
+            - Responda em no máximo 5 frases curtas, a menos que o usuário peça detalhes.
             - Nunca invente números do usuário; use exatamente os números reais do contexto recebido (e diga com clareza se um escopo ainda estiver zerado).
             - Seja prático e conversacional: dê respostas claras, bem estruturadas em parágrafos curtos ou tópicos simples sem markdown excessivo (evite asteriscos duplicados ** e tabelas complexas).
             - Quando o usuário estiver apenas conversando ou pedindo ideias/conselhos, conduza o diálogo naturalmente e faça perguntas úteis para ajudar na decisão.
@@ -100,16 +137,18 @@ class AlfredAiService {
     private val structuredSystemInstruction = content {
         text(
             """
-            Você é o Alfred, mordomo financeiro executivo particular do usuário (inspirado no Tony e no mordomo de Gotham).
+            Você é o Alfred, mordomo financeiro executivo particular do usuário.
             Responda sempre em português do Brasil, de forma elegante, precisa e prestativa.
-            Analise mensagens de texto, transcrições de voz ou imagens de comprovantes/notas fiscais.
+            Uma única mensagem pode conter UMA ou VÁRIAS ações combinadas: extraia TODAS em "actions".
             Regra de separação estrita:
             - Use scope = "BUSINESS" quando o usuário mencionar empresa, negócio, cliente, venda, serviço prestado, fornecedor, nota fiscal PJ, imposto, faturamento ou caixa da empresa.
             - Use scope = "PERSONAL" quando for gasto pessoal, casa, mercado, almoço, academia, salário ou lazer — ou mantenha o escopo ativo sugerido se for ambíguo.
-            - Só use intent = "CREATE_TRANSACTION" quando houver um valor > 0 claro (na mensagem ou na imagem).
-            - Use intent = "CREATE_REMINDER" quando o usuário pedir para lembrar de pagar/cobrar algo.
-            - Use intent = "CREATE_GOAL" quando pedir para criar uma meta de economia ou reserva.
-            - Use intent = "QUERY_OR_CHAT" para perguntas sobre o saldo, resumos, conselhos de finanças/negócios ou conversas gerais.
+            Intenções:
+            - CREATE_TRANSACTION: gasto/receita com valor > 0 claro (ou comprovante/imagem).
+            - CREATE_REMINDER: lembrete com data/hora calculada usando a data/hora atual e fuso horário informados no prompt. Preencha "dueAtIso" em ISO-8601 com offset (ex: 2026-11-17T14:00:00-03:00). Se o usuário não informar o horário, defina 09:00 e mencione em "replyText" que marcou para as 09:00. Preencha "recurrence" (NONE, DAILY, WEEKLY, MONTHLY).
+            - CREATE_GOAL: criar nova meta de economia/reserva.
+            - CONTRIBUTE_GOAL: aportar/guardar valor em meta existente (ex: "guardei 200 na meta do iPhone" -> title = "iPhone", amount = 200.0).
+            - Se não houver nenhuma ação financeira clara para executar, retorne actions = [] e responda normalmente em replyText.
             """.trimIndent()
         )
     }
@@ -124,10 +163,28 @@ class AlfredAiService {
         )
     }
 
+    private val standardRequestOptions = RequestOptions(timeoutInMillis = AI_TIMEOUT_MS)
+    private val pingRequestOptions = RequestOptions(timeoutInMillis = PING_TIMEOUT_MS)
+
+    private fun lowestThinkingLevelFor(modelName: String): ThinkingLevel =
+        if (modelName.contains("flash-lite", ignoreCase = true)) {
+            ThinkingLevel.MINIMAL
+        } else {
+            // gemini-3.8-flash and 3.7-flash support LOW/MEDIUM/HIGH (MINIMAL returns HTTP 400)
+            ThinkingLevel.LOW
+        }
+
     private fun buildChatModel(modelName: String): GenerativeModel =
         Firebase.ai.generativeModel(
             modelName = modelName,
+            generationConfig = generationConfig {
+                maxOutputTokens = MAX_CHAT_OUTPUT_TOKENS
+                thinkingConfig = thinkingConfig {
+                    thinkingLevel = lowestThinkingLevelFor(modelName)
+                }
+            },
             systemInstruction = conversationalSystemInstruction,
+            requestOptions = standardRequestOptions,
         )
 
     private fun buildStructuredModel(modelName: String): GenerativeModel =
@@ -136,14 +193,25 @@ class AlfredAiService {
             generationConfig = generationConfig {
                 responseMimeType = "application/json"
                 responseSchema = commandSchema
+                thinkingConfig = thinkingConfig {
+                    thinkingLevel = lowestThinkingLevelFor(modelName)
+                }
             },
             systemInstruction = structuredSystemInstruction,
+            requestOptions = standardRequestOptions,
         )
 
     private fun buildInsightModel(modelName: String): GenerativeModel =
         Firebase.ai.generativeModel(
             modelName = modelName,
+            generationConfig = generationConfig {
+                maxOutputTokens = MAX_INSIGHT_OUTPUT_TOKENS
+                thinkingConfig = thinkingConfig {
+                    thinkingLevel = lowestThinkingLevelFor(modelName)
+                }
+            },
             systemInstruction = insightSystemInstruction,
+            requestOptions = standardRequestOptions,
         )
 
     private val primaryChatModel by lazy { buildChatModel(PRIMARY_MODEL) }
@@ -155,6 +223,43 @@ class AlfredAiService {
     private val primaryInsightModel by lazy { buildInsightModel(PRIMARY_MODEL) }
     private val fallbackInsightModel by lazy { buildInsightModel(FALLBACK_MODEL) }
 
+    suspend fun pingDebugStartup() {
+        val startedNs = System.nanoTime()
+        Log.d(TAG, "Iniciando ping de diagnóstico em $PRIMARY_MODEL (timeout=${PING_TIMEOUT_MS}ms)")
+        try {
+            val pingModel = Firebase.ai.generativeModel(
+                modelName = PRIMARY_MODEL,
+                generationConfig = generationConfig {
+                    maxOutputTokens = 32
+                    thinkingConfig = thinkingConfig {
+                        thinkingLevel = lowestThinkingLevelFor(PRIMARY_MODEL)
+                    }
+                },
+                requestOptions = pingRequestOptions,
+            )
+            val response = withTimeout(PING_TIMEOUT_MS) {
+                pingModel.generateContent("ok")
+            }
+            val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000L
+            Log.d(
+                TAG,
+                "Ping OK em $PRIMARY_MODEL (${elapsedMs}ms): resposta='${response.text?.take(40).orEmpty()}'"
+            )
+        } catch (e: TimeoutCancellationException) {
+            val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000L
+            Log.w(TAG, "Ping TIMEOUT em $PRIMARY_MODEL após ${elapsedMs}ms [${e::class.java.simpleName}]")
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000L
+            Log.e(
+                TAG,
+                "Ping FALHOU em $PRIMARY_MODEL após ${elapsedMs}ms [${e::class.java.simpleName}]: ${e.message}",
+                e
+            )
+        }
+    }
+
     fun shouldExtractStructuredAction(
         userMessage: String,
         receiptBitmap: Bitmap?,
@@ -163,7 +268,6 @@ class AlfredAiService {
         val normalized = normalizeForMatch(userMessage)
         if (normalized.isBlank()) return false
 
-        // Purely conversational / analytical questions should stream naturally
         val questionStarters = listOf(
             "como ", "qual ", "quais ", "quanto ", "quantos ", "por que ", "porque ",
             "o que ", "voce acha", "me explica", "me ajude", "me ajuda", "dica", "dicas",
@@ -171,10 +275,9 @@ class AlfredAiService {
             "resumo", "panorama", "vale a pena", "compensa", "devo ", "posso ", "preciso de ajuda"
         )
         if (normalized.endsWith("?") || questionStarters.any { normalized.startsWith(it) || normalized.contains(" $it") }) {
-            // Still allow explicit "me lembra ..." or "pode registrar ..."
             val explicitCommandOverride = listOf(
                 "me lembra", "lembra me", "cria um lembrete", "criar lembrete",
-                "registra ", "registrar ", "lanca ", "lançar ", "lancar ", "anota ", "anotar "
+                "registra ", "registrar ", "lanca ", "lancar ", "anota ", "anotar "
             )
             if (explicitCommandOverride.none { normalized.contains(it) }) {
                 return false
@@ -189,7 +292,8 @@ class AlfredAiService {
             "gastei", "paguei", "comprei", "recebi", "vendi", "faturei", "ganhei",
             "registra", "registrar", "lanca", "lancar", "anota", "anotar",
             "adiciona", "adicionar", "transferi", "pix", "boleto", "fatura",
-            "me lembra", "lembrete", "agendar", "agenda", "nova meta", "criar meta", "meta de"
+            "guardei", "depositei", "aportei", "coloquei", "juntei",
+            "me lembra", "lembrete", "agendar", "agenda", "nova meta", "criar meta", "meta de", "na meta"
         )
 
         if (actionVerbs.any { normalized.contains(it) } &&
@@ -201,22 +305,31 @@ class AlfredAiService {
         return false
     }
 
+    private fun currentDateTimeContextLine(): String {
+        val zone = ZoneId.systemDefault()
+        val now = ZonedDateTime.now(zone)
+        val formatted = now.format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)
+        val weekday = now.dayOfWeek.getDisplayName(java.time.format.TextStyle.FULL, Locale.forLanguageTag("pt-BR"))
+        return "Data/hora atual do dispositivo: $formatted ($weekday) | Fuso horário: ${zone.id}"
+    }
+
     fun streamConversation(
         userMessage: String,
         activeScope: FinanceScope,
         recentHistory: List<AlfredChatMessage>,
         financialContextSummary: String,
-    ): Flow<String> = flow {
+    ): Flow<AlfredStreamChunk> = flow {
         val sdkHistory = recentHistory
             .filter { it.text.isNotBlank() }
-            .takeLast(12)
+            .takeLast(8)
             .map { msg ->
                 val role = if (msg.sender == ChatSender.USER.wireValue) "user" else "model"
                 content(role) { text(msg.text) }
             }
 
         val contextualTurn = """
-            [Contexto financeiro atualizado — Escopo selecionado: ${activeScope.labelPt} (${activeScope.wireValue})]
+            [${currentDateTimeContextLine()}]
+            [Contexto: ${activeScope.labelPt} (${activeScope.wireValue})]
             $financialContextSummary
 
             [Mensagem atual do usuário]
@@ -226,47 +339,70 @@ class AlfredAiService {
         var emittedAny = false
         val accumulated = StringBuilder()
 
-        suspend fun runStream(model: GenerativeModel) {
-            withTimeout(AI_TIMEOUT_MS) {
-                val chat = model.startChat(history = sdkHistory)
-                chat.sendMessageStream(contextualTurn).collect { chunk ->
-                    val piece = chunk.text.orEmpty()
-                    if (piece.isNotEmpty()) {
-                        emittedAny = true
-                        accumulated.append(piece)
-                        emit(accumulated.toString())
+        suspend fun runStream(modelName: String, model: GenerativeModel) {
+            val startedNs = System.nanoTime()
+            var ttftMs = -1L
+            Log.d(TAG, "streamConversation START model=$modelName")
+            try {
+                withTimeout(AI_TIMEOUT_MS) {
+                    val chat = model.startChat(history = sdkHistory)
+                    chat.sendMessageStream(contextualTurn).collect { chunk ->
+                        val piece = chunk.text.orEmpty()
+                        if (piece.isNotEmpty()) {
+                            if (ttftMs < 0L) {
+                                ttftMs = ((System.nanoTime() - startedNs) / 1_000_000L).coerceAtLeast(1L)
+                                Log.d(TAG, "streamConversation FIRST_TOKEN model=$modelName ttft=${ttftMs}ms")
+                            }
+                            emittedAny = true
+                            accumulated.append(piece)
+                            emit(
+                                AlfredStreamChunk(
+                                    accumulatedText = accumulated.toString(),
+                                    firstTokenLatencyMs = ttftMs,
+                                )
+                            )
+                        }
                     }
                 }
+                val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000L
+                Log.d(TAG, "streamConversation END model=$modelName duration=${elapsedMs}ms ttft=${ttftMs}ms chars=${accumulated.length}")
+            } catch (e: TimeoutCancellationException) {
+                val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000L
+                Log.w(TAG, "streamConversation TIMEOUT model=$modelName duration=${elapsedMs}ms [${e::class.java.simpleName}]")
+                throw e
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000L
+                Log.e(TAG, "streamConversation FAIL model=$modelName duration=${elapsedMs}ms [${e::class.java.simpleName}]: ${e.message}", e)
+                throw e
             }
         }
 
         try {
-            runStream(primaryChatModel)
+            runStream(PRIMARY_MODEL, primaryChatModel)
             if (accumulated.isBlank()) {
-                throw IllegalStateException("O modelo retornou uma resposta vazia.")
+                throw IllegalStateException("O modelo $PRIMARY_MODEL retornou resposta vazia.")
             }
-        } catch (e: TimeoutCancellationException) {
-            Log.e(TAG, "Conversational stream timed out on $PRIMARY_MODEL", e)
-            throw e
-        } catch (e: CancellationException) {
-            throw e
-        } catch (primaryError: Exception) {
-            Log.w(TAG, "Primary chat model $PRIMARY_MODEL failed; emittedAny=$emittedAny", primaryError)
+        } catch (primaryError: Throwable) {
+            if (primaryError is CancellationException && primaryError !is TimeoutCancellationException) {
+                throw primaryError
+            }
             if (!emittedAny) {
                 accumulated.clear()
                 try {
-                    runStream(fallbackChatModel)
+                    runStream(FALLBACK_MODEL, fallbackChatModel)
                     if (accumulated.isBlank()) {
-                        throw IllegalStateException("O modelo alternativo retornou uma resposta vazia.")
+                        throw IllegalStateException("O modelo reserva $FALLBACK_MODEL retornou resposta vazia.")
                     }
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (fallbackError: Exception) {
-                    Log.e(TAG, "Fallback chat model $FALLBACK_MODEL also failed", fallbackError)
-                    throw IllegalStateException(formatAiError(fallbackError), fallbackError)
+                } catch (fallbackError: Throwable) {
+                    if (fallbackError is CancellationException && fallbackError !is TimeoutCancellationException) {
+                        throw fallbackError
+                    }
+                    throw AlfredAiException(formatAiError(fallbackError), fallbackError)
                 }
             } else {
-                throw IllegalStateException(formatAiError(primaryError), primaryError)
+                throw AlfredAiException(formatAiError(primaryError), primaryError)
             }
         }
     }
@@ -277,7 +413,7 @@ class AlfredAiService {
         activeScope: FinanceScope,
         recentHistory: List<AlfredChatMessage>,
         financialContextSummary: String,
-    ): AlfredParsedResponse {
+    ): AlfredMultiActionResponse {
         val recentDialogue = recentHistory
             .takeLast(6)
             .joinToString("\n") { msg ->
@@ -286,6 +422,7 @@ class AlfredAiService {
             }
 
         val promptText = """
+            ${currentDateTimeContextLine()}
             Escopo visual atual do usuário: ${activeScope.wireValue} (${activeScope.labelPt}).
             Contexto financeiro real atual:
             $financialContextSummary
@@ -296,58 +433,86 @@ class AlfredAiService {
             Mensagem atual do usuário: "$userMessage"
         """.trimIndent()
 
-        suspend fun executeOn(model: GenerativeModel): AlfredParsedResponse {
-            val response = withTimeout(AI_TIMEOUT_MS) {
-                if (receiptBitmap != null) {
-                    model.generateContent(
-                        content {
-                            image(receiptBitmap)
-                            text(promptText)
-                        }
-                    )
-                } else {
-                    model.generateContent(promptText)
-                }
-            }
-
-            val jsonText = response.text
-                ?: throw IllegalStateException("Alfred não recebeu resposta do modelo.")
-            val json = JSONObject(jsonText)
-
-            return AlfredParsedResponse(
-                intent = json.optString("intent", "QUERY_OR_CHAT"),
-                replyText = json.optString("replyText", "Às suas ordens, senhor."),
-                scope = FinanceScope.fromWire(json.optString("scope", activeScope.wireValue)),
-                transactionType = TransactionType.fromWire(json.optString("transactionType", "EXPENSE")),
-                title = json.optString("title", "Lançamento").ifBlank { "Lançamento" },
-                category = json.optString("category", "Outros").ifBlank { "Outros" },
-                amount = json.optDouble("amount", 0.0).let { if (it.isNaN()) 0.0 else it },
-                accountName = json.optString("accountName", "Carteira").ifBlank { "Carteira" },
-                isPaid = json.optBoolean("isPaid", true),
-                dueDateText = json.optString("dueDateText", "Em breve"),
-                actionSummary = json.optString("actionSummary", ""),
-            )
-        }
-
-        return try {
-            executeOn(primaryStructuredModel)
-        } catch (e: TimeoutCancellationException) {
-            Log.e(TAG, "Structured command timed out on $PRIMARY_MODEL", e)
-            throw e
-        } catch (e: CancellationException) {
-            throw e
-        } catch (primaryError: Exception) {
-            Log.w(TAG, "Primary structured model $PRIMARY_MODEL failed, trying $FALLBACK_MODEL", primaryError)
+        suspend fun executeOn(modelName: String, model: GenerativeModel): AlfredMultiActionResponse {
+            val startedNs = System.nanoTime()
+            Log.d(TAG, "interpretUserCommand START model=$modelName hasImage=${receiptBitmap != null}")
             try {
-                executeOn(fallbackStructuredModel)
+                val response = withTimeout(AI_TIMEOUT_MS) {
+                    if (receiptBitmap != null) {
+                        model.generateContent(
+                            content {
+                                image(receiptBitmap)
+                                text(promptText)
+                            }
+                        )
+                    } else {
+                        model.generateContent(promptText)
+                    }
+                }
+
+                val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000L
+                val jsonText = response.text
+                    ?: throw IllegalStateException("Alfred não recebeu resposta do modelo $modelName.")
+                Log.d(TAG, "interpretUserCommand END model=$modelName duration=${elapsedMs}ms")
+
+                val json = JSONObject(jsonText)
+                val replyText = json.optString("replyText", "Às suas ordens, senhor.")
+                val actionsJson = json.optJSONArray("actions") ?: JSONArray()
+                val parsedActions = buildList {
+                    for (i in 0 until actionsJson.length()) {
+                        val obj = actionsJson.optJSONObject(i) ?: continue
+                        val intent = obj.optString("intent", "").trim()
+                        if (intent.isBlank()) continue
+                        add(
+                            AlfredParsedAction(
+                                intent = intent,
+                                scope = FinanceScope.fromWire(obj.optString("scope", activeScope.wireValue)),
+                                transactionType = TransactionType.fromWire(obj.optString("transactionType", "EXPENSE")),
+                                title = obj.optString("title", "").trim(),
+                                category = obj.optString("category", "Outros").ifBlank { "Outros" },
+                                amount = obj.optDouble("amount", 0.0).let { if (it.isNaN() || it < 0.0) 0.0 else it },
+                                accountName = obj.optString("accountName", "Carteira").ifBlank { "Carteira" },
+                                isPaid = obj.optBoolean("isPaid", true),
+                                dueDateText = obj.optString("dueDateText", ""),
+                                dueAtIso = obj.optString("dueAtIso", ""),
+                                recurrence = obj.optString("recurrence", "NONE").ifBlank { "NONE" },
+                                actionSummary = obj.optString("actionSummary", ""),
+                            )
+                        )
+                    }
+                }
+
+                return AlfredMultiActionResponse(
+                    replyText = replyText,
+                    actions = parsedActions,
+                )
             } catch (e: TimeoutCancellationException) {
-                Log.e(TAG, "Structured command timed out on $FALLBACK_MODEL", e)
+                val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000L
+                Log.w(TAG, "interpretUserCommand TIMEOUT model=$modelName duration=${elapsedMs}ms [${e::class.java.simpleName}]")
                 throw e
             } catch (e: CancellationException) {
                 throw e
-            } catch (fallbackError: Exception) {
-                Log.e(TAG, "Fallback structured model $FALLBACK_MODEL failed", fallbackError)
-                throw IllegalStateException(formatAiError(fallbackError), fallbackError)
+            } catch (e: Exception) {
+                val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000L
+                Log.e(TAG, "interpretUserCommand FAIL model=$modelName duration=${elapsedMs}ms [${e::class.java.simpleName}]: ${e.message}", e)
+                throw e
+            }
+        }
+
+        return try {
+            executeOn(PRIMARY_MODEL, primaryStructuredModel)
+        } catch (primaryError: Throwable) {
+            if (primaryError is CancellationException && primaryError !is TimeoutCancellationException) {
+                throw primaryError
+            }
+            Log.w(TAG, "Tentando modelo reserva $FALLBACK_MODEL após falha em $PRIMARY_MODEL [${primaryError::class.java.simpleName}]")
+            try {
+                executeOn(FALLBACK_MODEL, fallbackStructuredModel)
+            } catch (fallbackError: Throwable) {
+                if (fallbackError is CancellationException && fallbackError !is TimeoutCancellationException) {
+                    throw fallbackError
+                }
+                throw AlfredAiException(formatAiError(fallbackError), fallbackError)
             }
         }
     }
@@ -357,6 +522,7 @@ class AlfredAiService {
         financialContextSummary: String,
     ): Flow<String> = flow {
         val prompt = """
+            ${currentDateTimeContextLine()}
             Analise o panorama atual de ${scope.labelPt} (${scope.wireValue}):
             $financialContextSummary
             Escreva um diagnóstico rápido e uma recomendação prática.
@@ -365,46 +531,59 @@ class AlfredAiService {
         var emittedAny = false
         val accumulated = StringBuilder()
 
-        suspend fun runStream(model: GenerativeModel) {
-            withTimeout(AI_TIMEOUT_MS) {
-                model.generateContentStream(prompt).collect { chunk ->
-                    val piece = chunk.text.orEmpty()
-                    if (piece.isNotEmpty()) {
-                        emittedAny = true
-                        accumulated.append(piece)
-                        emit(accumulated.toString())
+        suspend fun runStream(modelName: String, model: GenerativeModel) {
+            val startedNs = System.nanoTime()
+            Log.d(TAG, "streamInsight START model=$modelName scope=${scope.wireValue}")
+            try {
+                withTimeout(AI_TIMEOUT_MS) {
+                    model.generateContentStream(prompt).collect { chunk ->
+                        val piece = chunk.text.orEmpty()
+                        if (piece.isNotEmpty()) {
+                            emittedAny = true
+                            accumulated.append(piece)
+                            emit(accumulated.toString())
+                        }
                     }
                 }
+                val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000L
+                Log.d(TAG, "streamInsight END model=$modelName duration=${elapsedMs}ms")
+            } catch (e: TimeoutCancellationException) {
+                val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000L
+                Log.w(TAG, "streamInsight TIMEOUT model=$modelName duration=${elapsedMs}ms [${e::class.java.simpleName}]")
+                throw e
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000L
+                Log.e(TAG, "streamInsight FAIL model=$modelName duration=${elapsedMs}ms [${e::class.java.simpleName}]: ${e.message}", e)
+                throw e
             }
         }
 
         try {
-            runStream(primaryInsightModel)
+            runStream(PRIMARY_MODEL, primaryInsightModel)
             if (accumulated.isBlank()) {
-                throw IllegalStateException("Resposta vazia ao gerar insight.")
+                throw IllegalStateException("O modelo $PRIMARY_MODEL retornou insight vazio.")
             }
-        } catch (e: TimeoutCancellationException) {
-            Log.e(TAG, "Insight stream timed out", e)
-            throw e
-        } catch (e: CancellationException) {
-            throw e
-        } catch (primaryError: Exception) {
-            Log.w(TAG, "Primary insight model $PRIMARY_MODEL failed; emittedAny=$emittedAny", primaryError)
+        } catch (primaryError: Throwable) {
+            if (primaryError is CancellationException && primaryError !is TimeoutCancellationException) {
+                throw primaryError
+            }
             if (!emittedAny) {
                 accumulated.clear()
                 try {
-                    runStream(fallbackInsightModel)
+                    runStream(FALLBACK_MODEL, fallbackInsightModel)
                     if (accumulated.isBlank()) {
-                        throw IllegalStateException("Resposta vazia ao gerar insight.")
+                        throw IllegalStateException("O modelo reserva $FALLBACK_MODEL retornou insight vazio.")
                     }
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (fallbackError: Exception) {
-                    Log.e(TAG, "Fallback insight model $FALLBACK_MODEL failed", fallbackError)
-                    throw IllegalStateException(formatAiError(fallbackError), fallbackError)
+                } catch (fallbackError: Throwable) {
+                    if (fallbackError is CancellationException && fallbackError !is TimeoutCancellationException) {
+                        throw fallbackError
+                    }
+                    throw AlfredAiException(formatAiError(fallbackError), fallbackError)
                 }
             } else {
-                throw IllegalStateException(formatAiError(primaryError), primaryError)
+                throw AlfredAiException(formatAiError(primaryError), primaryError)
             }
         }
     }
@@ -416,28 +595,61 @@ class AlfredAiService {
     }
 
     private fun formatAiError(error: Throwable): String {
-        val raw = error.localizedMessage ?: error.message ?: ""
+        val root = generateSequence(error) { it.cause }.lastOrNull() ?: error
+        val raw = "${error.localizedMessage.orEmpty()} ${root.localizedMessage.orEmpty()}".trim()
         val lower = raw.lowercase()
-        return when {
-            lower.contains("403") || lower.contains("app check") || lower.contains("attestation") ->
-                "Falha de verificação do App Check/Firebase AI (403). Reabra o app ou verifique a conexão."
-            lower.contains("404") || lower.contains("not found") || lower.contains("model") ->
-                "Modelo de IA indisponível no momento ($raw)."
-            lower.contains("network") || lower.contains("unable to resolve") || lower.contains("connect") ->
-                "Sem conexão estável para falar com o Alfred. Verifique sua internet."
+        val baseMessage = when {
+            error is TimeoutCancellationException || root is TimeoutCancellationException || lower.contains("timeout") ->
+                "Tempo limite de 20s excedido nos modelos de IA. Verifique sua conexão ou registre manualmente."
+
+            lower.contains("has not been used") ||
+                lower.contains("not enabled") ||
+                lower.contains("service_disabled") ||
+                lower.contains("firebaseai") && lower.contains("disabled") ||
+                lower.contains("generative language") && lower.contains("disabled") ->
+                "A API do Firebase AI Logic não está habilitada neste projeto Firebase."
+
+            lower.contains("403") ||
+                lower.contains("app check") ||
+                lower.contains("attestation") ||
+                lower.contains("appcheck") ->
+                "Falha de verificação do App Check (403). Confirme o token de debug no Console do Firebase."
+
+            lower.contains("unknownhost") ||
+                lower.contains("unable to resolve") ||
+                lower.contains("failed to connect") ||
+                lower.contains("network") ||
+                lower.contains("socket") ->
+                "Sem conexão estável de rede para falar com o Alfred. Você pode registrar manualmente."
+
             lower.contains("quota") || lower.contains("429") ->
-                "Limite temporário de requisições atingido. Aguarde alguns segundos."
+                "Cota temporária da IA atingida (429). Tente em instantes ou registre manualmente."
+
             raw.isNotBlank() ->
                 "Não foi possível obter resposta do Alfred: $raw"
+
             else ->
                 "Não foi possível obter resposta do Alfred no momento."
         }
+        return if (BuildConfig.DEBUG) {
+            "$baseMessage [${error::class.java.simpleName}]"
+        } else {
+            baseMessage
+        }
     }
 
-    private companion object {
-        const val TAG = "AlfredAiService"
-        const val PRIMARY_MODEL = "gemini-3.8-flash"
-        const val FALLBACK_MODEL = "gemini-3.5-flash-lite"
-        const val AI_TIMEOUT_MS = 60_000L
+    companion object {
+        const val TAG = "AlfredAI"
+        const val PRIMARY_MODEL = "gemini-3.5-flash-lite"
+        const val FALLBACK_MODEL = "gemini-3.8-flash"
+        const val AI_TIMEOUT_MS = 20_000L
+        const val PING_TIMEOUT_MS = 10_000L
+        const val MAX_CHAT_OUTPUT_TOKENS = 500
+        const val MAX_INSIGHT_OUTPUT_TOKENS = 240
     }
 }
+
+class AlfredAiException(
+    override val message: String,
+    cause: Throwable? = null,
+) : Exception(message, cause)

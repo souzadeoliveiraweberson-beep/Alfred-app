@@ -12,11 +12,21 @@ import com.example.data.model.FinanceGoal
 import com.example.data.model.FinanceReminder
 import com.example.data.model.FinanceScope
 import com.example.data.model.FinanceTransaction
+import com.example.data.model.ReminderRecurrence
+import com.example.data.model.ReminderScheduleHelper
 import com.example.data.model.TransactionType
 import com.example.data.remote.AlfredAiService
+import com.example.data.remote.AlfredParsedAction
+import com.example.data.remote.GoalMatcher
+import com.example.data.remote.LocalCommandParser
+import com.example.data.remote.LocalQueryResponder
+import com.example.data.remote.ManualEntryDraft
+import com.example.data.remote.WeeklySummaryBuilder
 import com.example.data.repository.FinanceRepository
+import com.example.notifications.AlfredNotificationBridge
 import com.example.ui.components.CurrencyFormatter
 import com.example.ui.components.MonthHelper
+import com.google.firebase.Timestamp
 import com.google.firebase.firestore.FirebaseFirestoreException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
@@ -30,6 +40,11 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.Date
+import java.util.Locale
 
 sealed interface UiState<out T> {
     data object Loading : UiState<Nothing>
@@ -48,8 +63,15 @@ sealed interface InsightUiState {
 sealed interface ChatStatus {
     data object Idle : ChatStatus
     data object Thinking : ChatStatus
-    data class Streaming(val partialText: String) : ChatStatus
-    data class Error(val message: String, val failedPrompt: String? = null) : ChatStatus
+    data class Streaming(
+        val partialText: String,
+        val ttftMs: Long? = null,
+    ) : ChatStatus
+    data class Error(
+        val message: String,
+        val failedPrompt: String? = null,
+        val manualDraft: ManualEntryDraft? = null,
+    ) : ChatStatus
 }
 
 data class CategorySlice(
@@ -79,6 +101,7 @@ class FinanceViewModel(
     private val repository: FinanceRepository,
     private val aiService: AlfredAiService,
     private val currentUserId: String,
+    private val notificationBridge: AlfredNotificationBridge? = null,
 ) : ViewModel() {
 
     private val _selectedMonthKey = MutableStateFlow(MonthHelper.DEFAULT_MONTH_KEY)
@@ -97,6 +120,16 @@ class FinanceViewModel(
     val chatStatus: StateFlow<ChatStatus> = _chatStatus.asStateFlow()
 
     private val _optimisticMessages = MutableStateFlow<List<AlfredChatMessage>>(emptyList())
+    private val _debugTtftByContent = MutableStateFlow<Map<String, Long>>(emptyMap())
+
+    private data class RetryCommandState(
+        val txIds: MutableList<String> = mutableListOf(),
+        val reminderIds: MutableList<String> = mutableListOf(),
+        val goalIds: MutableList<String> = mutableListOf(),
+        val completedGoalKeys: MutableSet<String> = mutableSetOf(),
+    )
+
+    private val retryStates = mutableMapOf<String, RetryCommandState>()
 
     private val _actionError = MutableStateFlow<String?>(null)
     val actionError: StateFlow<String?> = _actionError.asStateFlow()
@@ -122,20 +155,42 @@ class FinanceViewModel(
             .toUiState("Erro ao carregar conversa com o Alfred")
 
     val chatMessagesState: StateFlow<UiState<List<AlfredChatMessage>>> =
-        combine(remoteChatMessagesState, _optimisticMessages) { remoteState, pending ->
+        combine(
+            remoteChatMessagesState,
+            _optimisticMessages,
+            _debugTtftByContent,
+        ) { remoteState, pending, ttftMap ->
+            fun attachTtft(items: List<AlfredChatMessage>): List<AlfredChatMessage> =
+                if (ttftMap.isEmpty()) {
+                    items
+                } else {
+                    items.map { msg ->
+                        if (msg.debugTtftMs != null) {
+                            msg
+                        } else {
+                            val tracked = ttftMap[msg.text]
+                            if (tracked != null && msg.sender == ChatSender.ALFRED.wireValue) {
+                                msg.copy(debugTtftMs = tracked)
+                            } else {
+                                msg
+                            }
+                        }
+                    }
+                }
+
             when (remoteState) {
                 is UiState.Success -> {
                     val remote = remoteState.data
                     val unmatchedPending = pending.filter { local ->
                         remote.none { r -> r.sender == local.sender && r.text == local.text }
                     }
-                    UiState.Success(remote + unmatchedPending)
+                    UiState.Success(attachTtft(remote + unmatchedPending))
                 }
                 is UiState.Loading -> {
-                    if (pending.isNotEmpty()) UiState.Success(pending) else UiState.Loading
+                    if (pending.isNotEmpty()) UiState.Success(attachTtft(pending)) else UiState.Loading
                 }
                 is UiState.Error -> {
-                    if (pending.isNotEmpty()) UiState.Success(pending) else remoteState
+                    if (pending.isNotEmpty()) UiState.Success(attachTtft(pending)) else remoteState
                 }
             }
         }.stateIn(
@@ -146,6 +201,44 @@ class FinanceViewModel(
 
     val personalSummary: StateFlow<ScopeSummary> = buildScopeSummary(FinanceScope.PERSONAL)
     val businessSummary: StateFlow<ScopeSummary> = buildScopeSummary(FinanceScope.BUSINESS)
+
+    private var hasSeededGoals = false
+
+    init {
+        if (notificationBridge != null) {
+            viewModelScope.launch {
+                remindersState.collect { state ->
+                    if (state is UiState.Success) {
+                        runCatching { notificationBridge.syncReminders(state.data) }
+                            .onFailure { Log.w(TAG, "Falha ao sincronizar alarmes de lembretes", it) }
+                    }
+                }
+            }
+            viewModelScope.launch {
+                goalsState.collect { state ->
+                    if (state is UiState.Success) {
+                        runCatching {
+                            if (!hasSeededGoals) {
+                                hasSeededGoals = true
+                                notificationBridge.seedGoalMilestonesIfAbsent(state.data)
+                            } else {
+                                notificationBridge.checkGoalMilestones(state.data)
+                            }
+                        }.onFailure { Log.w(TAG, "Falha ao checar marcos de metas", it) }
+                    }
+                }
+            }
+        }
+    }
+
+    fun resyncNotifications() {
+        val bridge = notificationBridge ?: return
+        val reminders = (remindersState.value as? UiState.Success)?.data ?: return
+        viewModelScope.launch {
+            runCatching { bridge.syncReminders(reminders) }
+                .onFailure { Log.w(TAG, "Falha ao reagendar notificações", it) }
+        }
+    }
 
     private fun buildScopeSummary(scope: FinanceScope): StateFlow<ScopeSummary> =
         combine(
@@ -385,6 +478,9 @@ class FinanceViewModel(
         title: String,
         amount: Double,
         dueDateText: String,
+        dueAt: Timestamp? = null,
+        recurrence: ReminderRecurrence = ReminderRecurrence.NONE,
+        monthKey: String = _selectedMonthKey.value,
     ) {
         if (title.isBlank()) return
         viewModelScope.launch {
@@ -395,7 +491,9 @@ class FinanceViewModel(
                         title = title.trim(),
                         amount = amount.coerceAtLeast(0.0),
                         dueDateText = dueDateText.ifBlank { "Em breve" },
-                        monthKey = _selectedMonthKey.value,
+                        dueAt = dueAt,
+                        recurrence = recurrence.wireValue,
+                        monthKey = monthKey,
                         isCompleted = false,
                     )
                 )
@@ -407,10 +505,62 @@ class FinanceViewModel(
         }
     }
 
+    fun updateReminder(
+        reminderId: String,
+        title: String,
+        amount: Double,
+        dueDateText: String,
+        dueAt: Timestamp?,
+        recurrence: ReminderRecurrence,
+        monthKey: String = _selectedMonthKey.value,
+    ) {
+        if (reminderId.isBlank() || title.isBlank()) return
+        viewModelScope.launch {
+            try {
+                repository.updateReminder(
+                    reminderId = reminderId,
+                    title = title.trim(),
+                    amount = amount.coerceAtLeast(0.0),
+                    dueDateText = dueDateText.ifBlank { "Em breve" },
+                    dueAt = dueAt,
+                    recurrence = recurrence.wireValue,
+                    monthKey = monthKey,
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _actionError.value = e.localizedMessage ?: "Falha ao atualizar lembrete."
+            }
+        }
+    }
+
     fun toggleReminderCompleted(reminder: FinanceReminder) {
         viewModelScope.launch {
             try {
-                repository.toggleReminderCompleted(reminder.id, !reminder.isCompleted)
+                val markingComplete = !reminder.isCompleted
+                val recurrence = ReminderRecurrence.fromWire(reminder.recurrence)
+                if (markingComplete && recurrence != ReminderRecurrence.NONE) {
+                    val baseMillis = reminder.dueAt?.toDate()?.time ?: System.currentTimeMillis()
+                    val nextMillis = ReminderScheduleHelper.computeNextOccurrenceMillis(baseMillis, recurrence)
+                    if (nextMillis != null) {
+                        val zone = ZoneId.systemDefault()
+                        val nextId = ReminderScheduleHelper.deterministicNextOccurrenceId(reminder.id, nextMillis, zone)
+                        val nextDueAt = Timestamp(Date(nextMillis))
+                        val nextDueDateText = ReminderScheduleHelper.formatDueDateText(nextMillis, zoneId = zone)
+                        val nextMonthKey = Instant.ofEpochMilli(nextMillis)
+                            .atZone(zone)
+                            .format(DateTimeFormatter.ofPattern("yyyy-MM", Locale.US))
+                        repository.completeRecurringReminder(
+                            reminder = reminder,
+                            nextOccurrenceId = nextId,
+                            nextDueAt = nextDueAt,
+                            nextDueDateText = nextDueDateText,
+                            nextMonthKey = nextMonthKey,
+                        )
+                        return@launch
+                    }
+                }
+                repository.toggleReminderCompleted(reminder.id, markingComplete)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -462,7 +612,13 @@ class FinanceViewModel(
         if (delta <= 0.0) return
         viewModelScope.launch {
             try {
-                repository.updateGoalAmount(goal.id, goal.currentAmount + delta)
+                val updatedAmount = goal.currentAmount + delta
+                repository.updateGoalAmount(goal.id, updatedAmount)
+                notificationBridge?.let { bridge ->
+                    runCatching {
+                        bridge.checkGoalMilestones(listOf(goal.copy(currentAmount = updatedAmount)))
+                    }
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -497,10 +653,17 @@ class FinanceViewModel(
                     latestText = partial
                     targetFlow.value = InsightUiState.Streaming(partial)
                 }
-                targetFlow.value = InsightUiState.Success(latestText)
+                targetFlow.value = if (latestText.isNotBlank()) {
+                    InsightUiState.Success(latestText)
+                } else {
+                    InsightUiState.Error("Alfred não retornou o insight. Toque para tentar novamente.")
+                }
             } catch (e: TimeoutCancellationException) {
-                targetFlow.value = InsightUiState.Error("Tempo limite excedido ao consultar o Alfred.")
+                targetFlow.value = InsightUiState.Error("Tempo limite de 20s excedido ao consultar o Alfred.")
             } catch (e: CancellationException) {
+                if (targetFlow.value is InsightUiState.Loading || targetFlow.value is InsightUiState.Streaming) {
+                    targetFlow.value = InsightUiState.Idle
+                }
                 throw e
             } catch (e: Exception) {
                 targetFlow.value = InsightUiState.Error(
@@ -508,6 +671,28 @@ class FinanceViewModel(
                 )
             }
         }
+    }
+
+    fun requestWeeklySummary(scope: FinanceScope) {
+        val allTx = (transactionsState.value as? UiState.Success)?.data.orEmpty()
+        val allRem = (remindersState.value as? UiState.Success)?.data.orEmpty()
+        val allGoals = (goalsState.value as? UiState.Success)?.data.orEmpty()
+        val report = WeeklySummaryBuilder.build(
+            scope = scope,
+            transactions = allTx,
+            reminders = allRem,
+            goals = allGoals,
+        )
+        val alfredMessage = AlfredChatMessage(
+            id = "local_alfred_${System.currentTimeMillis()}",
+            userId = currentUserId,
+            sender = ChatSender.ALFRED.wireValue,
+            text = report.text,
+            scope = scope.wireValue,
+            actionSummary = report.badge,
+        )
+        _optimisticMessages.value = _optimisticMessages.value + alfredMessage
+        persistAlfredReplySafely(alfredMessage)
     }
 
     fun sendChatMessage(
@@ -521,8 +706,9 @@ class FinanceViewModel(
             return
         }
         val effectivePrompt = trimmed.ifBlank { "Analise este comprovante e registre o gasto ou receita." }
-
         val historySnapshot = (chatMessagesState.value as? UiState.Success)?.data.orEmpty()
+        val retryKey = "${activeScope.wireValue}|$effectivePrompt"
+        val retryState = retryStates.getOrPut(retryKey) { RetryCommandState() }
 
         val userMessage = AlfredChatMessage(
             id = "local_user_${System.currentTimeMillis()}",
@@ -535,143 +721,411 @@ class FinanceViewModel(
         _optimisticMessages.value = _optimisticMessages.value + userMessage
         _chatStatus.value = ChatStatus.Thinking
 
-        // Persist user message without blocking AI response latency
+        // Persist user message without blocking command processing or AI latency
         viewModelScope.launch {
             try {
                 repository.addChatMessage(userMessage)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                Log.w(TAG, "Failed to persist user chat message to Firestore", e)
+                Log.w(TAG, "Falha ao salvar mensagem do usuário no Firestore: ${e.message}", e)
             }
         }
 
         viewModelScope.launch {
+            val draftHint = LocalCommandParser.extractManualDraft(effectivePrompt, activeScope)
             try {
-                val fullContext = buildString {
-                    appendLine(buildContextSummaryForAi(FinanceScope.PERSONAL))
-                    appendLine()
-                    appendLine(buildContextSummaryForAi(FinanceScope.BUSINESS))
+                val knownAccounts = (accountsState.value as? UiState.Success)?.data.orEmpty()
+                val allGoals = (goalsState.value as? UiState.Success)?.data.orEmpty()
+                val localBadges = mutableListOf<String>()
+                val localReplies = mutableListOf<String>()
+                var primaryOutputScope = activeScope
+                var txIdx = 0
+                var remIdx = 0
+                var goalIdx = 0
+
+                fun nextId(bucket: MutableList<String>, index: Int, collection: String): String {
+                    while (bucket.size <= index) {
+                        bucket.add(repository.generateDocumentId(collection))
+                    }
+                    return bucket[index]
                 }
 
-                if (aiService.shouldExtractStructuredAction(effectivePrompt, receiptBitmap)) {
+                // 1) Compound local parser (no AI) for transactions & goal contributions when no receipt bitmap
+                val splitResult = if (receiptBitmap == null) {
+                    LocalCommandParser.splitAndResolve(effectivePrompt, activeScope, knownAccounts)
+                } else {
+                    null
+                }
+
+                if (splitResult != null) {
+                    for (localParsed in splitResult.localTransactions) {
+                        if (localParsed.amount <= 0.0 || localParsed.title.isBlank()) continue
+                        val matchedAccount = knownAccounts.firstOrNull { acc ->
+                            acc.scope == localParsed.scope.wireValue &&
+                                localParsed.accountName.isNotBlank() &&
+                                acc.name.equals(localParsed.accountName, ignoreCase = true)
+                        }
+                        val resolvedAccountName = matchedAccount?.name
+                            ?: localParsed.accountName.ifBlank {
+                                if (localParsed.scope == FinanceScope.BUSINESS) "Caixa PJ" else "Carteira"
+                            }
+                        val presetTxId = nextId(retryState.txIds, txIdx++, "transactions")
+                        repository.addTransaction(
+                            tx = FinanceTransaction(
+                                scope = localParsed.scope.wireValue,
+                                type = localParsed.type.wireValue,
+                                title = localParsed.title,
+                                category = localParsed.category,
+                                amount = localParsed.amount,
+                                accountId = matchedAccount?.id.orEmpty(),
+                                accountName = resolvedAccountName,
+                                monthKey = _selectedMonthKey.value,
+                                dayOfMonth = 15,
+                                isPaid = localParsed.isPaid,
+                                isRecurring = false,
+                            ),
+                            presetId = presetTxId,
+                        )
+                        val tipo = if (localParsed.type == TransactionType.INCOME) "Receita" else "Despesa"
+                        localBadges.add("${localParsed.scope.labelPt} • $tipo ${CurrencyFormatter.formatBrl(localParsed.amount)}")
+                        localReplies.add(localParsed.toAlfredConfirmation())
+                        primaryOutputScope = localParsed.scope
+                    }
+
+                    for ((gIdx, contrib) in splitResult.localGoalContributions.withIndex()) {
+                        val matchedGoal = GoalMatcher.findBestMatch(contrib.goalQuery, allGoals, contrib.scope)
+                        if (matchedGoal != null) {
+                            val contribKey = "local:$gIdx:${matchedGoal.id}:${contrib.amount}"
+                            if (contribKey !in retryState.completedGoalKeys) {
+                                val updatedGoalAmount = matchedGoal.currentAmount + contrib.amount
+                                repository.updateGoalAmount(matchedGoal.id, updatedGoalAmount)
+                                retryState.completedGoalKeys.add(contribKey)
+                                notificationBridge?.let { bridge ->
+                                    runCatching {
+                                        bridge.checkGoalMilestones(
+                                            listOf(matchedGoal.copy(currentAmount = updatedGoalAmount))
+                                        )
+                                    }
+                                }
+                            }
+                            val goalScope = FinanceScope.fromWire(matchedGoal.scope)
+                            val updatedTotal = matchedGoal.currentAmount + contrib.amount
+                            localBadges.add("${goalScope.labelPt} • +${CurrencyFormatter.formatBrl(contrib.amount)} em ${matchedGoal.title}")
+                            localReplies.add(
+                                "Aporte de ${CurrencyFormatter.formatBrl(contrib.amount)} adicionado à meta \"${matchedGoal.title}\" " +
+                                    "(agora em ${CurrencyFormatter.formatBrl(updatedTotal)} de ${CurrencyFormatter.formatBrl(matchedGoal.targetAmount)})."
+                            )
+                            primaryOutputScope = goalScope
+                        } else {
+                            localReplies.add(
+                                "Senhor, não encontrei uma meta correspondente a \"${contrib.goalQuery}\". " +
+                                    "Pode informar o nome exato da meta ou pedir para eu criar uma nova?"
+                            )
+                        }
+                    }
+                }
+
+                val remainingPrompt = if (receiptBitmap != null) {
+                    effectivePrompt
+                } else {
+                    splitResult?.unresolvedPrompt.orEmpty()
+                }
+
+                // Pure local resolution when nothing unresolved remains
+                if (receiptBitmap == null && remainingPrompt.isBlank() && (localReplies.isNotEmpty() || localBadges.isNotEmpty())) {
+                    val alfredMessage = AlfredChatMessage(
+                        id = "local_alfred_${System.currentTimeMillis()}",
+                        userId = currentUserId,
+                        sender = ChatSender.ALFRED.wireValue,
+                        text = localReplies.joinToString("\n"),
+                        scope = primaryOutputScope.wireValue,
+                        actionSummary = localBadges.joinToString("\n"),
+                    )
+                    _optimisticMessages.value = _optimisticMessages.value + alfredMessage
+                    _chatStatus.value = ChatStatus.Idle
+                    retryStates.remove(retryKey)
+                    persistAlfredReplySafely(alfredMessage)
+                    return@launch
+                }
+
+                // 2) Local instant query path (no AI) when no local writes happened
+                if (receiptBitmap == null && localReplies.isEmpty()) {
+                    val allTx = (transactionsState.value as? UiState.Success)?.data.orEmpty()
+                    val queryReply = LocalQueryResponder.tryAnswer(
+                        rawInput = effectivePrompt,
+                        activeScope = activeScope,
+                        personalSummary = personalSummary.value,
+                        businessSummary = businessSummary.value,
+                        allTransactions = allTx,
+                        selectedMonthKey = _selectedMonthKey.value,
+                    )
+                    if (queryReply != null) {
+                        val alfredMessage = AlfredChatMessage(
+                            id = "local_alfred_${System.currentTimeMillis()}",
+                            userId = currentUserId,
+                            sender = ChatSender.ALFRED.wireValue,
+                            text = queryReply.replyText,
+                            scope = queryReply.scope.wireValue,
+                            actionSummary = queryReply.badge,
+                        )
+                        _optimisticMessages.value = _optimisticMessages.value + alfredMessage
+                        _chatStatus.value = ChatStatus.Idle
+                        retryStates.remove(retryKey)
+                        persistAlfredReplySafely(alfredMessage)
+                        return@launch
+                    }
+                }
+
+                // 3) Gemini path (reduced context: active scope only, +1 line if other scope is mentioned)
+                val aiInput = remainingPrompt.ifBlank { effectivePrompt }
+                val scopedContext = buildChatContextForAi(activeScope, aiInput)
+
+                if (aiService.shouldExtractStructuredAction(aiInput, receiptBitmap)) {
                     val parsed = aiService.interpretUserCommand(
-                        userMessage = effectivePrompt,
+                        userMessage = aiInput,
                         receiptBitmap = receiptBitmap,
                         activeScope = activeScope,
                         recentHistory = historySnapshot,
-                        financialContextSummary = fullContext,
+                        financialContextSummary = scopedContext,
                     )
 
-                    var recordedBadge = parsed.actionSummary
-                    when (parsed.intent) {
-                        "CREATE_TRANSACTION" -> {
-                            if (parsed.amount > 0.0) {
-                                repository.addTransaction(
-                                    FinanceTransaction(
-                                        scope = parsed.scope.wireValue,
-                                        type = parsed.transactionType.wireValue,
-                                        title = parsed.title,
-                                        category = parsed.category,
-                                        amount = parsed.amount,
-                                        accountName = parsed.accountName,
-                                        monthKey = _selectedMonthKey.value,
-                                        dayOfMonth = 15,
-                                        isPaid = parsed.isPaid,
-                                        isRecurring = false,
+                    val aiBadges = mutableListOf<String>()
+                    val aiNotes = mutableListOf<String>()
+                    var aiPrimaryScope: FinanceScope? = null
+
+                    suspend fun executeAiAction(actionIdx: Int, action: AlfredParsedAction) {
+                        if (aiPrimaryScope == null) aiPrimaryScope = action.scope
+                        when (action.intent) {
+                            "CREATE_TRANSACTION" -> {
+                                val cleanTitle = action.title.trim()
+                                if (action.amount > 0.0 && cleanTitle.isNotBlank()) {
+                                    val matchedAccount = knownAccounts.firstOrNull { acc ->
+                                        acc.scope == action.scope.wireValue &&
+                                            action.accountName.isNotBlank() &&
+                                            acc.name.equals(action.accountName, ignoreCase = true)
+                                    }
+                                    val resolvedAccount = matchedAccount?.name ?: action.accountName
+                                    val presetId = nextId(retryState.txIds, txIdx++, "transactions")
+                                    repository.addTransaction(
+                                        tx = FinanceTransaction(
+                                            scope = action.scope.wireValue,
+                                            type = action.transactionType.wireValue,
+                                            title = cleanTitle,
+                                            category = action.category,
+                                            amount = action.amount,
+                                            accountId = matchedAccount?.id.orEmpty(),
+                                            accountName = resolvedAccount,
+                                            monthKey = _selectedMonthKey.value,
+                                            dayOfMonth = 15,
+                                            isPaid = action.isPaid,
+                                            isRecurring = false,
+                                        ),
+                                        presetId = presetId,
                                     )
-                                )
-                                val tipo = if (parsed.transactionType == TransactionType.INCOME) "Receita" else "Despesa"
-                                recordedBadge = "${parsed.scope.labelPt} • $tipo ${CurrencyFormatter.formatBrl(parsed.amount)}"
+                                    val tipo = if (action.transactionType == TransactionType.INCOME) "Receita" else "Despesa"
+                                    aiBadges.add("${action.scope.labelPt} • $tipo ${CurrencyFormatter.formatBrl(action.amount)}")
+                                } else {
+                                    aiNotes.add("Senhor, preciso de um valor positivo e de uma descrição para registrar o lançamento.")
+                                }
+                            }
+
+                            "CREATE_REMINDER" -> {
+                                val cleanTitle = action.title.trim()
+                                if (cleanTitle.isNotBlank()) {
+                                    val parsedDue = ReminderScheduleHelper.parseDueAtIso(action.dueAtIso)
+                                    val dueText = parsedDue?.displayText
+                                        ?: action.dueDateText.ifBlank { "Em breve" }
+                                    val rec = ReminderRecurrence.fromWire(action.recurrence)
+                                    val monthKey = parsedDue?.monthKey ?: _selectedMonthKey.value
+                                    val presetId = nextId(retryState.reminderIds, remIdx++, "reminders")
+                                    repository.addReminder(
+                                        reminder = FinanceReminder(
+                                            scope = action.scope.wireValue,
+                                            title = cleanTitle,
+                                            amount = action.amount.coerceAtLeast(0.0),
+                                            dueDateText = dueText,
+                                            dueAt = parsedDue?.timestamp,
+                                            recurrence = rec.wireValue,
+                                            monthKey = monthKey,
+                                            isCompleted = false,
+                                        ),
+                                        presetId = presetId,
+                                    )
+                                    val recTag = if (rec != ReminderRecurrence.NONE) " (${rec.labelPt})" else ""
+                                    aiBadges.add("${action.scope.labelPt} • Lembrete: $dueText$recTag")
+                                } else {
+                                    aiNotes.add("Senhor, qual título devo colocar neste lembrete?")
+                                }
+                            }
+
+                            "CREATE_GOAL" -> {
+                                val cleanTitle = action.title.trim()
+                                if (action.amount > 0.0 && cleanTitle.isNotBlank()) {
+                                    val presetId = nextId(retryState.goalIds, goalIdx++, "goals")
+                                    repository.addGoal(
+                                        goal = FinanceGoal(
+                                            scope = action.scope.wireValue,
+                                            title = cleanTitle,
+                                            targetAmount = action.amount,
+                                            currentAmount = 0.0,
+                                            deadlineText = action.dueDateText.take(40),
+                                        ),
+                                        presetId = presetId,
+                                    )
+                                    aiBadges.add("${action.scope.labelPt} • Meta ${CurrencyFormatter.formatBrl(action.amount)}")
+                                } else {
+                                    aiNotes.add(
+                                        if (cleanTitle.isNotBlank()) {
+                                            "Senhor, qual valor alvo em reais você gostaria de definir para a meta \"$cleanTitle\"?"
+                                        } else {
+                                            "Senhor, informe o objetivo e o valor em reais para que eu crie a meta."
+                                        }
+                                    )
+                                }
+                            }
+
+                            "CONTRIBUTE_GOAL" -> {
+                                val queryTitle = action.title.trim()
+                                val delta = action.amount
+                                if (delta <= 0.0) {
+                                    aiNotes.add("Senhor, qual valor você deseja aportar na meta?")
+                                } else {
+                                    val matchedGoal = GoalMatcher.findBestMatch(queryTitle, allGoals, action.scope)
+                                    if (matchedGoal != null) {
+                                        val contribKey = "ai:$actionIdx:${matchedGoal.id}:$delta"
+                                        if (contribKey !in retryState.completedGoalKeys) {
+                                            val updatedGoalAmount = matchedGoal.currentAmount + delta
+                                            repository.updateGoalAmount(matchedGoal.id, updatedGoalAmount)
+                                            retryState.completedGoalKeys.add(contribKey)
+                                            notificationBridge?.let { bridge ->
+                                                runCatching {
+                                                    bridge.checkGoalMilestones(
+                                                        listOf(matchedGoal.copy(currentAmount = updatedGoalAmount))
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        val goalScope = FinanceScope.fromWire(matchedGoal.scope)
+                                        aiPrimaryScope = goalScope
+                                        aiBadges.add("${goalScope.labelPt} • +${CurrencyFormatter.formatBrl(delta)} em ${matchedGoal.title}")
+                                    } else {
+                                        aiNotes.add(
+                                            "Senhor, não encontrei uma meta correspondente a \"${queryTitle.ifBlank { "informada" }}\". " +
+                                                "Pode dizer o nome exato ou pedir para eu criar essa meta?"
+                                        )
+                                    }
+                                }
                             }
                         }
+                    }
 
-                        "CREATE_REMINDER" -> {
-                            repository.addReminder(
-                                FinanceReminder(
-                                    scope = parsed.scope.wireValue,
-                                    title = parsed.title,
-                                    amount = parsed.amount.coerceAtLeast(0.0),
-                                    dueDateText = parsed.dueDateText.ifBlank { "Em breve" },
-                                    monthKey = _selectedMonthKey.value,
-                                    isCompleted = false,
-                                )
-                            )
-                            recordedBadge = "${parsed.scope.labelPt} • Lembrete: ${parsed.dueDateText}"
-                        }
+                    parsed.actions.forEachIndexed { idx, action ->
+                        executeAiAction(idx, action)
+                    }
 
-                        "CREATE_GOAL" -> {
-                            val target = if (parsed.amount > 0.0) parsed.amount else 1000.0
-                            repository.addGoal(
-                                FinanceGoal(
-                                    scope = parsed.scope.wireValue,
-                                    title = parsed.title,
-                                    targetAmount = target,
-                                    currentAmount = 0.0,
-                                    deadlineText = parsed.dueDateText.take(40),
-                                )
-                            )
-                            recordedBadge = "${parsed.scope.labelPt} • Meta ${CurrencyFormatter.formatBrl(target)}"
+                    val combinedReplies = buildList {
+                        addAll(localReplies)
+                        if (parsed.replyText.isNotBlank() && aiNotes.isEmpty()) {
+                            add(parsed.replyText.trim())
+                        } else if (aiNotes.isNotEmpty()) {
+                            if (parsed.actions.any { it.intent != "CONTRIBUTE_GOAL" } && parsed.replyText.isNotBlank()) {
+                                add(parsed.replyText.trim())
+                            }
+                            addAll(aiNotes)
                         }
                     }
+                    val allBadges = localBadges + aiBadges
+                    val finalReplyText = combinedReplies.joinToString("\n").ifBlank { parsed.replyText }
+                    val resolvedScope = aiPrimaryScope ?: primaryOutputScope
 
                     val alfredMessage = AlfredChatMessage(
                         id = "local_alfred_${System.currentTimeMillis()}",
                         userId = currentUserId,
                         sender = ChatSender.ALFRED.wireValue,
-                        text = parsed.replyText,
-                        scope = parsed.scope.wireValue,
-                        actionSummary = recordedBadge,
+                        text = finalReplyText,
+                        scope = resolvedScope.wireValue,
+                        actionSummary = allBadges.joinToString("\n"),
                     )
                     _optimisticMessages.value = _optimisticMessages.value + alfredMessage
                     _chatStatus.value = ChatStatus.Idle
+                    retryStates.remove(retryKey)
                     persistAlfredReplySafely(alfredMessage)
                 } else {
                     var streamedText = ""
+                    var firstTokenLatencyMs: Long? = null
                     aiService.streamConversation(
-                        userMessage = effectivePrompt,
+                        userMessage = aiInput,
                         activeScope = activeScope,
                         recentHistory = historySnapshot,
-                        financialContextSummary = fullContext,
-                    ).collect { partial ->
-                        streamedText = partial
-                        _chatStatus.value = ChatStatus.Streaming(partial)
+                        financialContextSummary = scopedContext,
+                    ).collect { chunk ->
+                        streamedText = chunk.accumulatedText
+                        if (firstTokenLatencyMs == null && chunk.firstTokenLatencyMs > 0L) {
+                            firstTokenLatencyMs = chunk.firstTokenLatencyMs
+                        }
+                        val previewText = if (localReplies.isNotEmpty()) {
+                            (localReplies + chunk.accumulatedText).joinToString("\n")
+                        } else {
+                            chunk.accumulatedText
+                        }
+                        _chatStatus.value = ChatStatus.Streaming(
+                            partialText = previewText,
+                            ttftMs = firstTokenLatencyMs,
+                        )
                     }
 
-                    val finalText = streamedText.trim()
-                    if (finalText.isBlank()) {
+                    val finalStream = streamedText.trim()
+                    if (finalStream.isBlank() && localReplies.isEmpty()) {
                         _chatStatus.value = ChatStatus.Error(
-                            message = "Alfred não retornou conteúdo. Tente novamente.",
+                            message = "Alfred não retornou conteúdo. Tente novamente ou registre manualmente.",
                             failedPrompt = effectivePrompt,
+                            manualDraft = draftHint,
                         )
                     } else {
+                        val combinedFinal = (localReplies + listOfNotNull(finalStream.takeIf { it.isNotBlank() }))
+                            .joinToString("\n")
+                        if (firstTokenLatencyMs != null) {
+                            _debugTtftByContent.value = _debugTtftByContent.value + (combinedFinal to firstTokenLatencyMs!!)
+                        }
                         val alfredMessage = AlfredChatMessage(
                             id = "local_alfred_${System.currentTimeMillis()}",
                             userId = currentUserId,
                             sender = ChatSender.ALFRED.wireValue,
-                            text = finalText,
-                            scope = activeScope.wireValue,
-                            actionSummary = "",
+                            text = combinedFinal,
+                            scope = primaryOutputScope.wireValue,
+                            actionSummary = localBadges.joinToString("\n"),
+                            debugTtftMs = firstTokenLatencyMs,
                         )
                         _optimisticMessages.value = _optimisticMessages.value + alfredMessage
                         _chatStatus.value = ChatStatus.Idle
+                        retryStates.remove(retryKey)
                         persistAlfredReplySafely(alfredMessage)
                     }
                 }
             } catch (e: TimeoutCancellationException) {
-                Log.e(TAG, "Alfred chat timed out", e)
+                Log.e("AlfredAI", "Timeout no chat [${e::class.java.simpleName}]", e)
                 _chatStatus.value = ChatStatus.Error(
-                    message = "Alfred demorou mais que o esperado para responder. Toque em tentar novamente.",
+                    message = "Tempo limite excedido ao aguardar o modelo. Tente novamente ou registre manualmente.",
                     failedPrompt = effectivePrompt,
+                    manualDraft = draftHint,
                 )
             } catch (e: CancellationException) {
+                if (_chatStatus.value is ChatStatus.Thinking || _chatStatus.value is ChatStatus.Streaming) {
+                    _chatStatus.value = ChatStatus.Idle
+                }
                 throw e
             } catch (e: Exception) {
-                Log.e(TAG, "Alfred chat error", e)
+                Log.e("AlfredAI", "Erro no chat [${e::class.java.simpleName}]: ${e.message}", e)
                 _chatStatus.value = ChatStatus.Error(
                     message = e.localizedMessage ?: "Falha ao falar com o Alfred.",
                     failedPrompt = effectivePrompt,
+                    manualDraft = draftHint,
                 )
+            } finally {
+                if (_chatStatus.value is ChatStatus.Thinking || _chatStatus.value is ChatStatus.Streaming) {
+                    _chatStatus.value = ChatStatus.Idle
+                }
             }
         }
     }
@@ -689,21 +1143,48 @@ class FinanceViewModel(
         }
     }
 
+    private fun buildChatContextForAi(activeScope: FinanceScope, userPrompt: String): String {
+        val primarySummary = buildContextSummaryForAi(activeScope)
+        val otherScope = if (activeScope == FinanceScope.PERSONAL) {
+            FinanceScope.BUSINESS
+        } else {
+            FinanceScope.PERSONAL
+        }
+        return if (mentionsScope(userPrompt, otherScope)) {
+            val other = if (otherScope == FinanceScope.PERSONAL) personalSummary.value else businessSummary.value
+            val oneLiner = "${otherScope.labelPt}: Saldo R$ ${"%.2f".format(other.totalBalance)}, Receitas R$ ${"%.2f".format(other.monthIncome)}, Gastos R$ ${"%.2f".format(other.paidExpenses)}"
+            "$primarySummary\n$oneLiner"
+        } else {
+            primarySummary
+        }
+    }
+
+    private fun mentionsScope(prompt: String, scope: FinanceScope): Boolean {
+        val lower = java.text.Normalizer.normalize(prompt.lowercase(), java.text.Normalizer.Form.NFD)
+            .replace(Regex("\\p{InCombiningDiacriticalMarks}+"), "")
+        val keywords = if (scope == FinanceScope.BUSINESS) {
+            listOf("empresa", "pj", "negocio", "caixa", "venda", "vendas", "faturamento", "cliente", "fornecedor")
+        } else {
+            listOf("pessoal", "pessoais", "pf", "casa", "familia", "salario")
+        }
+        return keywords.any { kw -> Regex("""(?<!\w)${Regex.escape(kw)}(?!\w)""").containsMatchIn(lower) }
+    }
+
     private fun buildContextSummaryForAi(scope: FinanceScope): String {
         val summary = if (scope == FinanceScope.PERSONAL) personalSummary.value else businessSummary.value
         val monthLabel = MonthHelper.labelFor(_selectedMonthKey.value)
         val topCategories = summary.expenseSlices.take(4)
             .joinToString(", ") { "${it.category}: R$ ${"%.2f".format(it.amount)}" }
-            .ifBlank { "sem gastos registrados" }
+            .ifBlank { "sem gastos" }
         val accountsList = summary.scopeAccounts.take(5)
             .joinToString(", ") { "${it.name} (R$ ${"%.2f".format(it.balance)})" }
-            .ifBlank { "nenhuma conta cadastrada" }
+            .ifBlank { "nenhuma" }
         val recentTx = summary.monthTransactions.take(6)
             .joinToString("; ") {
                 val sign = if (it.type == TransactionType.INCOME.wireValue) "+" else "-"
                 "${it.title} ($sign R$ ${"%.2f".format(it.amount)}, ${it.category})"
             }
-            .ifBlank { "nenhum lançamento neste mês" }
+            .ifBlank { "nenhum" }
         val openReminders = summary.scopeReminders.filter { !it.isCompleted }.take(4)
             .joinToString(", ") { "${it.title} (${it.dueDateText}, R$ ${"%.2f".format(it.amount)})" }
             .ifBlank { "nenhum" }
@@ -713,14 +1194,12 @@ class FinanceViewModel(
 
         return """
             [${scope.labelPt} — $monthLabel]
-            Saldo/Caixa total: R$ ${"%.2f".format(summary.totalBalance)}
-            Receitas pagas no mês: R$ ${"%.2f".format(summary.monthIncome)} | A receber: R$ ${"%.2f".format(summary.pendingIncome)}
-            Gastos pagos no mês: R$ ${"%.2f".format(summary.paidExpenses)} | A pagar: R$ ${"%.2f".format(summary.pendingExpenses)}
-            Cartão de crédito no mês: R$ ${"%.2f".format(summary.creditCardTotal)}
-            Contas/Cartões: $accountsList
-            Principais categorias de gasto: $topCategories
-            Últimas movimentações: $recentTx
-            Lembretes abertos: $openReminders
+            Saldo: R$ ${"%.2f".format(summary.totalBalance)} | Receitas: R$ ${"%.2f".format(summary.monthIncome)} (a receber R$ ${"%.2f".format(summary.pendingIncome)})
+            Gastos pagos: R$ ${"%.2f".format(summary.paidExpenses)} (a pagar R$ ${"%.2f".format(summary.pendingExpenses)}) | Cartão: R$ ${"%.2f".format(summary.creditCardTotal)}
+            Contas: $accountsList
+            Top categorias: $topCategories
+            Recentes: $recentTx
+            Lembretes: $openReminders
             Metas: $goalsList
         """.trimIndent()
     }

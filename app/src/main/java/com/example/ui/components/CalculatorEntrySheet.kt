@@ -50,6 +50,7 @@ import androidx.compose.ui.unit.dp
 import com.example.data.model.FinanceAccount
 import com.example.data.model.FinanceScope
 import com.example.data.model.TransactionType
+import com.example.data.remote.ManualEntryDraft
 import com.example.ui.theme.GothamHairline
 import com.example.ui.theme.GothamHairlineStrong
 import com.example.ui.theme.GothamObsidian
@@ -75,6 +76,7 @@ fun CalculatorEntrySheet(
     initialScope: FinanceScope,
     personalAccounts: List<FinanceAccount>,
     businessAccounts: List<FinanceAccount>,
+    initialDraft: ManualEntryDraft? = null,
     onDismiss: () -> Unit,
     onConfirm: (
         scope: FinanceScope,
@@ -88,13 +90,21 @@ fun CalculatorEntrySheet(
     ) -> Unit,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    var selectedScope by remember { mutableStateOf(initialScope) }
-    var selectedType by remember { mutableStateOf(TransactionType.EXPENSE) }
-    var expression by remember { mutableStateOf("0") }
-    var title by remember { mutableStateOf("") }
-    var selectedCategory by remember { mutableStateOf("Alimentação") }
+    var selectedScope by remember(initialDraft) { mutableStateOf(initialDraft?.scope ?: initialScope) }
+    var selectedType by remember(initialDraft) { mutableStateOf(initialDraft?.type ?: TransactionType.EXPENSE) }
+    var expression by remember(initialDraft) {
+        mutableStateOf(
+            if (initialDraft != null && initialDraft.amount > 0.0) {
+                formatDraftAmountForExpression(initialDraft.amount)
+            } else {
+                "0"
+            }
+        )
+    }
+    var title by remember(initialDraft) { mutableStateOf(initialDraft?.title.orEmpty()) }
+    var selectedCategory by remember(initialDraft) { mutableStateOf(initialDraft?.category ?: "Alimentação") }
     var selectedAccount by remember { mutableStateOf<FinanceAccount?>(null) }
-    var isPaid by remember { mutableStateOf(true) }
+    var isPaid by remember(initialDraft) { mutableStateOf(initialDraft?.isPaid ?: true) }
     var isRecurring by remember { mutableStateOf(false) }
 
     val categories = if (selectedScope == FinanceScope.BUSINESS) BUSINESS_CATEGORIES else PERSONAL_CATEGORIES
@@ -608,4 +618,17 @@ private fun evaluateCalculatorExpression(expr: String): Double {
         }
     }
     return if (result.isFinite() && result > 0.0) result else 0.0
+}
+
+private fun formatDraftAmountForExpression(amount: Double): String {
+    if (amount <= 0.0 || !amount.isFinite()) return "0"
+    val roundedLong = amount.toLong()
+    return if (amount == roundedLong.toDouble()) {
+        roundedLong.toString()
+    } else {
+        String.format(java.util.Locale.US, "%.2f", amount)
+            .trimEnd('0')
+            .trimEnd('.')
+            .replace('.', ',')
+    }
 }

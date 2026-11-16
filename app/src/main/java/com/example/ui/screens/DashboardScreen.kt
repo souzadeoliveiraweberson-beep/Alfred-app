@@ -44,10 +44,13 @@ import androidx.compose.material.icons.rounded.BusinessCenter
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.CreditCard
 import androidx.compose.material.icons.rounded.DeleteOutline
+import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.NotificationsNone
 import androidx.compose.material.icons.rounded.RadioButtonUnchecked
+import androidx.compose.material.icons.rounded.Repeat
 import androidx.compose.material.icons.automirrored.rounded.ReceiptLong
 import androidx.compose.material.icons.rounded.Schedule
+import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.Button
@@ -92,6 +95,8 @@ import com.example.data.model.FinanceAccount
 import com.example.data.model.FinanceReminder
 import com.example.data.model.FinanceScope
 import com.example.data.model.FinanceTransaction
+import com.example.data.model.ReminderRecurrence
+import com.example.data.model.ReminderScheduleHelper
 import com.example.data.model.TransactionType
 import com.example.ui.components.AppleSprings
 import com.example.ui.components.CurrencyFormatter
@@ -110,6 +115,10 @@ import com.example.ui.theme.GothamSurfaceElevated
 import com.example.ui.theme.GothamVoid
 import com.example.ui.viewmodel.InsightUiState
 import com.example.ui.viewmodel.ScopeSummary
+import com.google.firebase.Timestamp
+import java.time.LocalDate
+import java.time.LocalTime
+import java.time.format.DateTimeFormatter
 
 @Composable
 fun DashboardScreen(
@@ -129,14 +138,17 @@ fun DashboardScreen(
     onDeleteTransaction: (String) -> Unit,
     onAddAccount: (String, AccountKind, Double, Double) -> Unit,
     onDeleteAccount: (String) -> Unit,
-    onAddReminder: (String, Double, String) -> Unit,
+    onAddReminder: (String, Double, String, Timestamp?, ReminderRecurrence, String) -> Unit,
+    onUpdateReminder: (String, String, Double, String, Timestamp?, ReminderRecurrence, String) -> Unit,
     onToggleReminder: (FinanceReminder) -> Unit,
     onDeleteReminder: (String) -> Unit,
+    onOpenNotificationSettings: () -> Unit = {},
     onSignOut: () -> Unit,
     contentBottomPadding: androidx.compose.ui.unit.Dp,
 ) {
     var showAddAccountSheet by remember { mutableStateOf(false) }
-    var showAddReminderSheet by remember { mutableStateOf(false) }
+    var showReminderEditorSheet by remember { mutableStateOf(false) }
+    var editingReminder by remember { mutableStateOf<FinanceReminder?>(null) }
     var showProfileMenu by remember { mutableStateOf(false) }
 
     val isBusiness = scope == FinanceScope.BUSINESS
@@ -256,7 +268,10 @@ fun DashboardScreen(
                             )
                         }
                         IconButton(
-                            onClick = { showAddReminderSheet = true },
+                            onClick = {
+                                editingReminder = null
+                                showReminderEditorSheet = true
+                            },
                             modifier = Modifier
                                 .minimumInteractiveComponentSize()
                                 .testTag("reminders_button"),
@@ -264,6 +279,18 @@ fun DashboardScreen(
                             Icon(
                                 imageVector = Icons.Rounded.NotificationsNone,
                                 contentDescription = "Adicionar lembrete",
+                                tint = GothamPureWhite,
+                            )
+                        }
+                        IconButton(
+                            onClick = onOpenNotificationSettings,
+                            modifier = Modifier
+                                .minimumInteractiveComponentSize()
+                                .testTag("notification_settings_button"),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.Tune,
+                                contentDescription = "Configurar notificações",
                                 tint = GothamPureWhite,
                             )
                         }
@@ -559,7 +586,10 @@ fun DashboardScreen(
                 SectionHeaderRow(
                     title = if (isBusiness) "Agenda e Cobranças PJ" else "Próximos Lançamentos",
                     actionLabel = "+ Lembrete",
-                    onAction = { showAddReminderSheet = true },
+                    onAction = {
+                        editingReminder = null
+                        showReminderEditorSheet = true
+                    },
                     actionTag = "add_reminder_button",
                 )
             }
@@ -567,7 +597,10 @@ fun DashboardScreen(
             item {
                 if (summary.scopeReminders.isEmpty()) {
                     GothamInteractiveCard(
-                        onClick = { showAddReminderSheet = true },
+                        onClick = {
+                            editingReminder = null
+                            showReminderEditorSheet = true
+                        },
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(18.dp),
                     ) {
@@ -597,6 +630,10 @@ fun DashboardScreen(
                                 reminder = reminder,
                                 hideValues = hideValues,
                                 onToggle = { onToggleReminder(reminder) },
+                                onEdit = {
+                                    editingReminder = reminder
+                                    showReminderEditorSheet = true
+                                },
                                 onDelete = { onDeleteReminder(reminder.id) },
                             )
                         }
@@ -720,12 +757,22 @@ fun DashboardScreen(
         )
     }
 
-    if (showAddReminderSheet) {
-        AddReminderSheet(
-            onDismiss = { showAddReminderSheet = false },
-            onConfirm = { title, amount, dueText ->
-                onAddReminder(title, amount, dueText)
-                showAddReminderSheet = false
+    if (showReminderEditorSheet) {
+        val currentEditing = editingReminder
+        ReminderEditorSheet(
+            existingReminder = currentEditing,
+            onDismiss = {
+                showReminderEditorSheet = false
+                editingReminder = null
+            },
+            onConfirm = { title, amount, dueText, dueAt, recurrence, monthKey ->
+                if (currentEditing == null) {
+                    onAddReminder(title, amount, dueText, dueAt, recurrence, monthKey)
+                } else {
+                    onUpdateReminder(currentEditing.id, title, amount, dueText, dueAt, recurrence, monthKey)
+                }
+                showReminderEditorSheet = false
+                editingReminder = null
             },
         )
     }
@@ -832,11 +879,13 @@ private fun ReminderCard(
     reminder: FinanceReminder,
     hideValues: Boolean,
     onToggle: () -> Unit,
+    onEdit: () -> Unit,
     onDelete: () -> Unit,
 ) {
+    val recurrence = ReminderRecurrence.fromWire(reminder.recurrence)
     GothamInteractiveCard(
         onClick = onToggle,
-        modifier = Modifier.width(210.dp),
+        modifier = Modifier.width(224.dp),
         shape = RoundedCornerShape(18.dp),
         containerColor = if (reminder.isCompleted) GothamObsidian else GothamSurface,
         borderColor = if (reminder.isCompleted) GothamHairline else GothamHairlineStrong,
@@ -850,22 +899,66 @@ private fun ReminderCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Icon(
-                    imageVector = if (reminder.isCompleted) Icons.Rounded.CheckCircle else Icons.Rounded.RadioButtonUnchecked,
-                    contentDescription = if (reminder.isCompleted) "Concluído" else "Pendente",
-                    tint = if (reminder.isCompleted) GothamSilver else GothamPureWhite,
-                    modifier = Modifier.size(18.dp),
-                )
-                IconButton(
-                    onClick = onDelete,
-                    modifier = Modifier.size(24.dp),
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     Icon(
-                        imageVector = Icons.Rounded.DeleteOutline,
-                        contentDescription = "Remover lembrete",
-                        tint = GothamSlate,
-                        modifier = Modifier.size(16.dp),
+                        imageVector = if (reminder.isCompleted) Icons.Rounded.CheckCircle else Icons.Rounded.RadioButtonUnchecked,
+                        contentDescription = if (reminder.isCompleted) "Concluído" else "Pendente",
+                        tint = if (reminder.isCompleted) GothamSilver else GothamPureWhite,
+                        modifier = Modifier.size(18.dp),
                     )
+                    if (recurrence != ReminderRecurrence.NONE) {
+                        Surface(
+                            shape = RoundedCornerShape(50),
+                            color = Color.White.copy(alpha = 0.08f),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(3.dp),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Repeat,
+                                    contentDescription = null,
+                                    tint = GothamPearl,
+                                    modifier = Modifier.size(11.dp),
+                                )
+                                Text(
+                                    text = recurrence.labelPt,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = GothamPearl,
+                                )
+                            }
+                        }
+                    }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(
+                        onClick = onEdit,
+                        modifier = Modifier
+                            .size(28.dp)
+                            .testTag("edit_reminder_${reminder.id}"),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Edit,
+                            contentDescription = "Editar lembrete",
+                            tint = GothamSilver,
+                            modifier = Modifier.size(15.dp),
+                        )
+                    }
+                    IconButton(
+                        onClick = onDelete,
+                        modifier = Modifier.size(28.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.DeleteOutline,
+                            contentDescription = "Remover lembrete",
+                            tint = GothamSlate,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
                 }
             }
             Text(
@@ -884,8 +977,12 @@ private fun ReminderCard(
                     text = reminder.dueDateText,
                     style = MaterialTheme.typography.labelSmall,
                     color = GothamSilver,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
                 )
                 if (reminder.amount > 0.0) {
+                    Spacer(modifier = Modifier.width(6.dp))
                     Text(
                         text = CurrencyFormatter.formatBrl(reminder.amount, hideValues),
                         style = MaterialTheme.typography.labelLarge,
@@ -1150,13 +1247,45 @@ private fun AddAccountSheet(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun AddReminderSheet(
+private fun ReminderEditorSheet(
+    existingReminder: FinanceReminder?,
     onDismiss: () -> Unit,
-    onConfirm: (String, Double, String) -> Unit,
+    onConfirm: (String, Double, String, Timestamp?, ReminderRecurrence, String) -> Unit,
 ) {
-    var title by remember { mutableStateOf("") }
-    var amountText by remember { mutableStateOf("") }
-    var dueDateText by remember { mutableStateOf("Amanhã, 14:00") }
+    val dateFmt = remember { DateTimeFormatter.ofPattern("dd/MM/yyyy") }
+    val timeFmt = remember { DateTimeFormatter.ofPattern("HH:mm") }
+    val initialDate = remember(existingReminder) {
+        if (existingReminder != null) {
+            ReminderScheduleHelper.extractDateInput(existingReminder)
+        } else {
+            LocalDate.now().plusDays(1)
+        }
+    }
+    val initialTime = remember(existingReminder) {
+        if (existingReminder != null) {
+            ReminderScheduleHelper.extractTimeInput(existingReminder)
+        } else {
+            LocalTime.of(9, 0)
+        }
+    }
+
+    var title by remember(existingReminder) { mutableStateOf(existingReminder?.title.orEmpty()) }
+    var amountText by remember(existingReminder) {
+        mutableStateOf(
+            if (existingReminder != null && existingReminder.amount > 0.0) {
+                String.format(java.util.Locale.US, "%.2f", existingReminder.amount).replace('.', ',')
+            } else ""
+        )
+    }
+    var dateText by remember(existingReminder) { mutableStateOf(initialDate.format(dateFmt)) }
+    var timeText by remember(existingReminder) { mutableStateOf(initialTime.format(timeFmt)) }
+    var recurrence by remember(existingReminder) {
+        mutableStateOf(ReminderRecurrence.fromWire(existingReminder?.recurrence))
+    }
+
+    val parsedDate = runCatching { LocalDate.parse(dateText.trim(), dateFmt) }.getOrNull()
+    val parsedTime = runCatching { LocalTime.parse(timeText.trim(), timeFmt) }.getOrNull()
+    val isValidSchedule = parsedDate != null && parsedTime != null
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -1171,7 +1300,7 @@ private fun AddReminderSheet(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Text(
-                text = "Novo Lembrete Financeiro",
+                text = if (existingReminder == null) "Novo Lembrete Financeiro" else "Editar Lembrete",
                 style = MaterialTheme.typography.headlineMedium,
                 color = GothamPureWhite,
             )
@@ -1202,25 +1331,127 @@ private fun AddReminderSheet(
                     unfocusedTextColor = GothamPureWhite,
                 ),
             )
-            OutlinedTextField(
-                value = dueDateText,
-                onValueChange = { dueDateText = it },
-                label = { Text("Quando lembrar") },
-                singleLine = true,
+
+            // Quick date presets
+            Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                listOf(
+                    "Hoje" to LocalDate.now(),
+                    "Amanhã" to LocalDate.now().plusDays(1),
+                    "+7 dias" to LocalDate.now().plusDays(7),
+                ).forEach { (label, presetDate) ->
+                    val active = parsedDate == presetDate
+                    FilterChip(
+                        selected = active,
+                        onClick = { dateText = presetDate.format(dateFmt) },
+                        label = { Text(label) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = GothamPureWhite,
+                            selectedLabelColor = GothamVoid,
+                            containerColor = GothamSurface,
+                            labelColor = GothamSilver,
+                        ),
+                    )
+                }
+            }
+
+            Row(
                 modifier = Modifier.fillMaxWidth(),
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor = GothamPureWhite,
-                    unfocusedBorderColor = GothamHairline,
-                    focusedTextColor = GothamPureWhite,
-                    unfocusedTextColor = GothamPureWhite,
-                ),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                OutlinedTextField(
+                    value = dateText,
+                    onValueChange = { dateText = it },
+                    label = { Text("Data (dd/MM/aaaa)") },
+                    singleLine = true,
+                    isError = parsedDate == null,
+                    modifier = Modifier.weight(1.3f),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = GothamPureWhite,
+                        unfocusedBorderColor = GothamHairline,
+                        focusedTextColor = GothamPureWhite,
+                        unfocusedTextColor = GothamPureWhite,
+                    ),
+                )
+                OutlinedTextField(
+                    value = timeText,
+                    onValueChange = { timeText = it },
+                    label = { Text("Hora (HH:mm)") },
+                    singleLine = true,
+                    isError = parsedTime == null,
+                    modifier = Modifier.weight(1f),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = GothamPureWhite,
+                        unfocusedBorderColor = GothamHairline,
+                        focusedTextColor = GothamPureWhite,
+                        unfocusedTextColor = GothamPureWhite,
+                    ),
+                )
+            }
+
+            // Quick time presets
+            Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                listOf("09:00", "12:00", "14:00", "18:00").forEach { presetTime ->
+                    FilterChip(
+                        selected = timeText.trim() == presetTime,
+                        onClick = { timeText = presetTime },
+                        label = { Text(presetTime) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = GothamPureWhite,
+                            selectedLabelColor = GothamVoid,
+                            containerColor = GothamSurface,
+                            labelColor = GothamSilver,
+                        ),
+                    )
+                }
+            }
+
+            Text(
+                text = "Recorrência",
+                style = MaterialTheme.typography.labelMedium,
+                color = GothamSilver,
             )
+            Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                ReminderRecurrence.entries.forEach { option ->
+                    FilterChip(
+                        selected = recurrence == option,
+                        onClick = { recurrence = option },
+                        label = { Text(option.labelPt) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = GothamPureWhite,
+                            selectedLabelColor = GothamVoid,
+                            containerColor = GothamSurface,
+                            labelColor = GothamSilver,
+                        ),
+                    )
+                }
+            }
+
             Button(
                 onClick = {
                     val value = amountText.replace(',', '.').toDoubleOrNull() ?: 0.0
-                    onConfirm(title, value, dueDateText)
+                    val schedule = ReminderScheduleHelper.fromDateAndTime(
+                        date = parsedDate ?: LocalDate.now().plusDays(1),
+                        time = parsedTime ?: LocalTime.of(9, 0),
+                    )
+                    onConfirm(
+                        title,
+                        value,
+                        schedule.displayText,
+                        schedule.timestamp,
+                        recurrence,
+                        schedule.monthKey,
+                    )
                 },
-                enabled = title.isNotBlank(),
+                enabled = title.isNotBlank() && isValidSchedule,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(52.dp),
@@ -1230,7 +1461,10 @@ private fun AddReminderSheet(
                     contentColor = GothamVoid,
                 ),
             ) {
-                Text("Agendar Lembrete", fontWeight = FontWeight.Bold)
+                Text(
+                    text = if (existingReminder == null) "Agendar Lembrete" else "Salvar Alterações",
+                    fontWeight = FontWeight.Bold,
+                )
             }
         }
     }

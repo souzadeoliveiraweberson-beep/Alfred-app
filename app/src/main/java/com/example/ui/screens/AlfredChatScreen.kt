@@ -39,6 +39,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -74,6 +75,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
@@ -83,13 +85,16 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import com.example.BuildConfig
 import com.example.R
 import com.example.data.model.AlfredChatMessage
 import com.example.data.model.ChatSender
 import com.example.data.model.FinanceScope
+import com.example.data.remote.ManualEntryDraft
 import com.example.ui.components.GothamCard
 import com.example.ui.theme.GothamHairline
 import com.example.ui.theme.GothamHairlineStrong
@@ -119,6 +124,8 @@ fun AlfredChatScreen(
     activeScope: FinanceScope,
     onScopeChange: (FinanceScope) -> Unit,
     onSendMessage: (String, Bitmap?) -> Unit,
+    onRequestWeeklySummary: () -> Unit,
+    onOpenManualEntry: (ManualEntryDraft) -> Unit,
     onDismissError: () -> Unit,
     contentBottomPadding: Dp,
 ) {
@@ -229,7 +236,6 @@ fun AlfredChatScreen(
     }
 
     val imeBottom = WindowInsets.ime.asPaddingValues().calculateBottomPadding()
-    val effectiveBottomPadding = maxOf(imeBottom, contentBottomPadding)
 
     Box(
         modifier = Modifier
@@ -241,17 +247,26 @@ fun AlfredChatScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .widthIn(max = 680.dp)
-                .padding(bottom = effectiveBottomPadding),
+                .then(
+                    if (imeBottom > 0.dp) {
+                        Modifier.imePadding()
+                    } else {
+                        Modifier.padding(bottom = contentBottomPadding)
+                    }
+                ),
         ) {
             // Top bar inspired by Tony
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 20.dp, vertical = 14.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    modifier = Modifier.weight(1f),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
                     Box(
                         modifier = Modifier
                             .size(38.dp)
@@ -266,16 +281,19 @@ fun AlfredChatScreen(
                         )
                     }
                     Spacer(modifier = Modifier.width(10.dp))
-                    Column {
+                    Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = "Alfred",
                             style = MaterialTheme.typography.headlineMedium,
                             color = GothamPureWhite,
+                            maxLines = 1,
                         )
                         Text(
-                            text = "Finanças & Negócios • Voz, texto e foto",
+                            text = "Finanças & Negócios",
                             style = MaterialTheme.typography.labelMedium,
                             color = GothamSilver,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                         )
                     }
                 }
@@ -287,7 +305,8 @@ fun AlfredChatScreen(
                         Surface(
                             modifier = Modifier
                                 .clip(RoundedCornerShape(50))
-                                .clickable { onScopeChange(scopeOption) },
+                                .clickable { onScopeChange(scopeOption) }
+                                .testTag("chat_scope_${scopeOption.wireValue.lowercase()}"),
                             shape = RoundedCornerShape(50),
                             color = if (selected) GothamPureWhite else GothamSurface,
                             border = BorderStroke(1.dp, if (selected) GothamPureWhite else GothamHairline),
@@ -296,7 +315,9 @@ fun AlfredChatScreen(
                                 text = scopeOption.labelPt,
                                 style = MaterialTheme.typography.labelMedium,
                                 color = if (selected) GothamVoid else GothamSilver,
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                maxLines = 1,
+                                softWrap = false,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
                             )
                         }
                     }
@@ -308,8 +329,9 @@ fun AlfredChatScreen(
                 state = listState,
                 modifier = Modifier
                     .weight(1f)
-                    .fillMaxWidth(),
-                contentPadding = PaddingValues(horizontal = 20.dp, vertical = 12.dp),
+                    .fillMaxWidth()
+                    .clipToBounds(),
+                contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 10.dp, bottom = 14.dp),
                 verticalArrangement = Arrangement.spacedBy(14.dp),
             ) {
                 if (messages.isEmpty()) {
@@ -373,7 +395,11 @@ fun AlfredChatScreen(
                                     strokeWidth = 1.5.dp,
                                 )
                                 Text(
-                                    text = "Alfred respondendo...",
+                                    text = if (BuildConfig.DEBUG && chatStatus.ttftMs != null) {
+                                        "Alfred respondendo... (${chatStatus.ttftMs}ms)"
+                                    } else {
+                                        "Alfred respondendo..."
+                                    },
                                     style = MaterialTheme.typography.labelSmall,
                                     color = GothamSlate,
                                 )
@@ -414,50 +440,85 @@ fun AlfredChatScreen(
                     color = GothamSurfaceElevated,
                     border = BorderStroke(1.dp, GothamHairlineStrong),
                 ) {
-                    Row(
+                    Column(
                         modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        Text(
-                            text = errorText.orEmpty(),
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = GothamPearl,
-                            modifier = Modifier.weight(1f),
-                        )
-                        val failedPrompt = chatError?.failedPrompt
-                        if (!failedPrompt.isNullOrBlank()) {
-                            Surface(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(50))
-                                    .clickable {
-                                        onDismissError()
-                                        onSendMessage(failedPrompt, null)
-                                    },
-                                shape = RoundedCornerShape(50),
-                                color = GothamPureWhite,
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text(
+                                text = errorText.orEmpty(),
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = GothamPearl,
+                                modifier = Modifier.weight(1f),
+                            )
+                            IconButton(
+                                onClick = {
+                                    speechError = null
+                                    onDismissError()
+                                },
+                                modifier = Modifier.size(28.dp),
                             ) {
-                                Text(
-                                    text = "Tentar",
-                                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
-                                    color = GothamVoid,
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                Icon(
+                                    Icons.Rounded.Close,
+                                    contentDescription = "Fechar aviso",
+                                    tint = GothamPureWhite,
+                                    modifier = Modifier.size(16.dp),
                                 )
                             }
                         }
-                        IconButton(
-                            onClick = {
-                                speechError = null
-                                onDismissError()
-                            },
-                            modifier = Modifier.size(28.dp),
-                        ) {
-                            Icon(
-                                Icons.Rounded.Close,
-                                contentDescription = "Fechar aviso",
-                                tint = GothamPureWhite,
-                                modifier = Modifier.size(16.dp),
-                            )
+
+                        val failedPrompt = chatError?.failedPrompt
+                        val manualDraft = chatError?.manualDraft
+                        if (!failedPrompt.isNullOrBlank() || manualDraft != null) {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                if (!failedPrompt.isNullOrBlank()) {
+                                    Surface(
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(50))
+                                            .clickable {
+                                                onDismissError()
+                                                onSendMessage(failedPrompt, null)
+                                            }
+                                            .testTag("alfred_retry_button"),
+                                        shape = RoundedCornerShape(50),
+                                        color = GothamPureWhite,
+                                    ) {
+                                        Text(
+                                            text = "Tentar novamente",
+                                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                                            color = GothamVoid,
+                                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                        )
+                                    }
+                                }
+                                if (manualDraft != null) {
+                                    Surface(
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(50))
+                                            .clickable {
+                                                onDismissError()
+                                                onOpenManualEntry(manualDraft)
+                                            }
+                                            .testTag("alfred_manual_entry_button"),
+                                        shape = RoundedCornerShape(50),
+                                        color = GothamSurface,
+                                        border = BorderStroke(1.dp, GothamHairlineStrong),
+                                    ) {
+                                        Text(
+                                            text = "Registrar manualmente",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = GothamPureWhite,
+                                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                        )
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -471,6 +532,22 @@ fun AlfredChatScreen(
                     .padding(horizontal = 20.dp, vertical = 6.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
+                Surface(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(50))
+                        .clickable { onRequestWeeklySummary() }
+                        .testTag("alfred_weekly_summary_button"),
+                    shape = RoundedCornerShape(50),
+                    color = GothamPureWhite,
+                ) {
+                    Text(
+                        text = "Resumo da semana",
+                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                        color = GothamVoid,
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                    )
+                }
+
                 QUICK_PROMPTS.forEach { prompt ->
                     Surface(
                         modifier = Modifier
@@ -696,7 +773,7 @@ private fun ChatMessageItem(message: AlfredChatMessage) {
     } else {
         Column(
             modifier = Modifier.fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             Text(
                 text = message.text,
@@ -704,28 +781,43 @@ private fun ChatMessageItem(message: AlfredChatMessage) {
                 color = GothamPearl,
                 modifier = Modifier.padding(end = 24.dp),
             )
-            if (message.actionSummary.isNotBlank()) {
-                GothamCard(
-                    shape = RoundedCornerShape(12.dp),
-                    containerColor = GothamObsidian,
-                    borderColor = GothamHairlineStrong,
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.CheckCircle,
-                            contentDescription = null,
-                            tint = GothamPureWhite,
-                            modifier = Modifier.size(16.dp),
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = message.actionSummary,
-                            style = MaterialTheme.typography.labelLarge,
-                            color = GothamPureWhite,
-                        )
+            if (BuildConfig.DEBUG && message.debugTtftMs != null) {
+                Text(
+                    text = "1º token: ${message.debugTtftMs}ms",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = GothamSlate,
+                )
+            }
+            val badges = message.actionSummary
+                .split("\n")
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+            if (badges.isNotEmpty()) {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    badges.forEach { badge ->
+                        GothamCard(
+                            shape = RoundedCornerShape(12.dp),
+                            containerColor = GothamObsidian,
+                            borderColor = GothamHairlineStrong,
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.CheckCircle,
+                                    contentDescription = null,
+                                    tint = GothamPureWhite,
+                                    modifier = Modifier.size(16.dp),
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = badge,
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = GothamPureWhite,
+                                )
+                            }
+                        }
                     }
                 }
             }

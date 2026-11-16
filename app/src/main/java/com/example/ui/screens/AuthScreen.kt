@@ -248,7 +248,7 @@ fun AuthScreen(
                 Text(
                     text = "Uso estritamente pessoal • Seus dados ficam vinculados apenas a você.",
                     style = MaterialTheme.typography.labelMedium,
-                    color = GothamSlate,
+                    color = GothamSilver,
                     textAlign = TextAlign.Center,
                 )
             }

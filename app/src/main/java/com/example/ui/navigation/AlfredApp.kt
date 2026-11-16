@@ -1,6 +1,13 @@
 package com.example.ui.navigation
 
+import android.Manifest
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.provider.Settings
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
@@ -14,11 +21,13 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -36,6 +45,9 @@ import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.BusinessCenter
 import androidx.compose.material.icons.rounded.PieChart
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -47,6 +59,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -76,8 +89,16 @@ import com.example.R
 import com.example.data.model.FinanceScope
 import com.example.data.remote.AlfredAiService
 import com.example.data.remote.GoogleAuthHelper
+import com.example.data.remote.ManualEntryDraft
 import com.example.data.repository.FinanceRepository
+import com.example.notifications.AndroidNotificationBridge
+import com.example.notifications.NotificationChannels
+import com.example.notifications.NotificationPreferences
+import com.example.notifications.NotificationSettings
+import com.example.notifications.ReminderAlarmScheduler
+import com.example.notifications.SummaryWorkScheduler
 import com.example.ui.components.CalculatorEntrySheet
+import com.example.ui.components.NotificationSettingsSheet
 import com.example.ui.screens.AlfredChatScreen
 import com.example.ui.screens.AnalyticsScreen
 import com.example.ui.screens.AuthScreen
@@ -101,6 +122,7 @@ import com.google.firebase.firestore.FirebaseFirestore
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.launch
 
 const val ROUTE_FINANCES = "finances"
 const val ROUTE_BUSINESS = "business"
@@ -155,7 +177,11 @@ internal fun FirebaseAuth.authStateFlow(): Flow<FirebaseUser?> = callbackFlow {
 }
 
 @Composable
-fun AlfredApp(auth: FirebaseAuth = Firebase.auth) {
+fun AlfredApp(
+    auth: FirebaseAuth = Firebase.auth,
+    pendingNavRoute: String? = null,
+    onConsumeNavRoute: () -> Unit = {},
+) {
     val context = LocalContext.current
     val currentUser by auth.authStateFlow()
         .collectAsStateWithLifecycle(initialValue = auth.currentUser)
@@ -171,16 +197,30 @@ fun AlfredApp(auth: FirebaseAuth = Firebase.auth) {
         AuthScreen(onAuthSuccess = {})
     } else {
         key(user.uid) {
-            AuthenticatedAlfredShell(currentUser = user)
+            AuthenticatedAlfredShell(
+                currentUser = user,
+                pendingNavRoute = pendingNavRoute,
+                onConsumeNavRoute = onConsumeNavRoute,
+            )
         }
     }
 }
 
 @Composable
-private fun AuthenticatedAlfredShell(currentUser: FirebaseUser) {
+private fun AuthenticatedAlfredShell(
+    currentUser: FirebaseUser,
+    pendingNavRoute: String?,
+    onConsumeNavRoute: () -> Unit,
+) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val uid = currentUser.uid
+
+    val notificationPrefs = remember(context) { NotificationPreferences(context.applicationContext) }
+    val notificationBridge = remember(context) { AndroidNotificationBridge(context.applicationContext, notificationPrefs) }
+    val reminderScheduler = remember(context) { ReminderAlarmScheduler(context.applicationContext, notificationPrefs) }
+    val notificationSettings by notificationPrefs.settingsFlow
+        .collectAsStateWithLifecycle(initialValue = NotificationSettings())
 
     val financeViewModel: FinanceViewModel = viewModel(
         key = uid,
@@ -195,6 +235,7 @@ private fun AuthenticatedAlfredShell(currentUser: FirebaseUser) {
                     repository = FinanceRepository(db, Firebase.auth),
                     aiService = AlfredAiService(),
                     currentUserId = uid,
+                    notificationBridge = notificationBridge,
                 )
             }
         }
@@ -202,7 +243,56 @@ private fun AuthenticatedAlfredShell(currentUser: FirebaseUser) {
 
     var currentRoute by rememberSaveable { mutableStateOf(ROUTE_FINANCES) }
     var showCalculatorSheet by remember { mutableStateOf(false) }
+    var showNotificationSettingsSheet by remember { mutableStateOf(false) }
+    var showNotificationOnboarding by remember { mutableStateOf(false) }
+    var hasNotificationPermission by remember {
+        mutableStateOf(NotificationChannels.hasNotificationPermission(context))
+    }
+    var calculatorDraft by remember { mutableStateOf<ManualEntryDraft?>(null) }
     var chatActiveScope by rememberSaveable { mutableStateOf(FinanceScope.PERSONAL) }
+
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        hasNotificationPermission = granted || NotificationChannels.hasNotificationPermission(context)
+        coroutineScope.launch {
+            notificationPrefs.setOnboardingPromptShown(true)
+            if (granted) {
+                SummaryWorkScheduler.syncWork(context.applicationContext, notificationSettings)
+                financeViewModel.resyncNotifications()
+                snackbarHostState.showSnackbar("Notificações do Alfred ativadas.")
+            }
+        }
+    }
+
+    LaunchedEffect(pendingNavRoute) {
+        val target = pendingNavRoute
+        if (!target.isNullOrBlank() && NAV_TABS.any { it.route == target }) {
+            currentRoute = target
+            onConsumeNavRoute()
+        }
+    }
+
+    LaunchedEffect(
+        notificationSettings.dailySummaryEnabled,
+        notificationSettings.weeklySummaryEnabled,
+        notificationSettings.dailySummaryHour,
+        notificationSettings.dailySummaryMinute,
+    ) {
+        SummaryWorkScheduler.syncWork(context.applicationContext, notificationSettings)
+    }
+
+    LaunchedEffect(notificationSettings.onboardingPromptShown) {
+        hasNotificationPermission = NotificationChannels.hasNotificationPermission(context)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            !hasNotificationPermission &&
+            !notificationSettings.onboardingPromptShown
+        ) {
+            showNotificationOnboarding = true
+        }
+    }
 
     val selectedMonthKey by financeViewModel.selectedMonthKey.collectAsStateWithLifecycle()
     val hideValues by financeViewModel.hideValues.collectAsStateWithLifecycle()
@@ -214,7 +304,6 @@ private fun AuthenticatedAlfredShell(currentUser: FirebaseUser) {
     val chatStatus by financeViewModel.chatStatus.collectAsStateWithLifecycle()
     val actionError by financeViewModel.actionError.collectAsStateWithLifecycle()
 
-    val snackbarHostState = remember { SnackbarHostState() }
     LaunchedEffect(actionError) {
         val msg = actionError
         if (msg != null) {
@@ -321,7 +410,18 @@ private fun AuthenticatedAlfredShell(currentUser: FirebaseUser) {
                             chatActiveScope = chatActiveScope,
                             onChatScopeChange = { chatActiveScope = it },
                             onNavigate = { currentRoute = it },
-                            onOpenQuickAdd = { showCalculatorSheet = true },
+                            onOpenQuickAdd = {
+                                calculatorDraft = null
+                                showCalculatorSheet = true
+                            },
+                            onOpenManualEntry = { draft ->
+                                calculatorDraft = draft
+                                showCalculatorSheet = true
+                            },
+                            onOpenNotificationSettings = {
+                                hasNotificationPermission = NotificationChannels.hasNotificationPermission(context)
+                                showNotificationSettingsSheet = true
+                            },
                             onSignOut = { GoogleAuthHelper.signOut(context, coroutineScope) },
                             viewModel = financeViewModel,
                             contentBottomPadding = 16.dp,
@@ -330,6 +430,8 @@ private fun AuthenticatedAlfredShell(currentUser: FirebaseUser) {
                 }
             } else {
                 val isImeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+                val navBarBottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+                val dockContentBottomPadding = if (isImeVisible) 0.dp else (92.dp + navBarBottom)
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -350,17 +452,31 @@ private fun AuthenticatedAlfredShell(currentUser: FirebaseUser) {
                         chatActiveScope = chatActiveScope,
                         onChatScopeChange = { chatActiveScope = it },
                         onNavigate = { currentRoute = it },
-                        onOpenQuickAdd = { showCalculatorSheet = true },
+                        onOpenQuickAdd = {
+                            calculatorDraft = null
+                            showCalculatorSheet = true
+                        },
+                        onOpenManualEntry = { draft ->
+                            calculatorDraft = draft
+                            showCalculatorSheet = true
+                        },
+                        onOpenNotificationSettings = {
+                            hasNotificationPermission = NotificationChannels.hasNotificationPermission(context)
+                            showNotificationSettingsSheet = true
+                        },
                         onSignOut = { GoogleAuthHelper.signOut(context, coroutineScope) },
                         viewModel = financeViewModel,
-                        contentBottomPadding = if (isImeVisible) 0.dp else 92.dp,
+                        contentBottomPadding = dockContentBottomPadding,
                     )
 
                     if (!isImeVisible) {
                         GothamFloatingBottomDock(
                             currentRoute = currentRoute,
                             onSelectRoute = { currentRoute = it },
-                            onQuickAdd = { showCalculatorSheet = true },
+                            onQuickAdd = {
+                                calculatorDraft = null
+                                showCalculatorSheet = true
+                            },
                             modifier = Modifier.align(Alignment.BottomCenter),
                         )
                     }
@@ -374,7 +490,11 @@ private fun AuthenticatedAlfredShell(currentUser: FirebaseUser) {
             initialScope = activeQuickAddScope,
             personalAccounts = personalSummary.scopeAccounts,
             businessAccounts = businessSummary.scopeAccounts,
-            onDismiss = { showCalculatorSheet = false },
+            initialDraft = calculatorDraft,
+            onDismiss = {
+                showCalculatorSheet = false
+                calculatorDraft = null
+            },
             onConfirm = { scope, type, title, category, amount, account, isPaid, isRecurring ->
                 financeViewModel.addTransaction(
                     scope = scope,
@@ -387,7 +507,130 @@ private fun AuthenticatedAlfredShell(currentUser: FirebaseUser) {
                     isRecurring = isRecurring,
                 )
                 showCalculatorSheet = false
+                calculatorDraft = null
             },
+        )
+    }
+
+    if (showNotificationOnboarding) {
+        AlertDialog(
+            onDismissRequest = {
+                showNotificationOnboarding = false
+                coroutineScope.launch { notificationPrefs.setOnboardingPromptShown(true) }
+            },
+            containerColor = GothamObsidian,
+            titleContentColor = GothamPureWhite,
+            textContentColor = GothamSilver,
+            title = {
+                Text("Ativar avisos do Alfred", style = MaterialTheme.typography.titleLarge)
+            },
+            text = {
+                Text(
+                    "Posso avisar 1 hora antes e na hora exata das suas contas, além de mandar resumos diários e marcos das metas — tudo localmente no aparelho.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showNotificationOnboarding = false
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = GothamPureWhite,
+                        contentColor = GothamVoid,
+                    ),
+                ) {
+                    Text("Ativar avisos", fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        showNotificationOnboarding = false
+                        coroutineScope.launch { notificationPrefs.setOnboardingPromptShown(true) }
+                    },
+                ) {
+                    Text("Agora não", color = GothamSilver)
+                }
+            },
+        )
+    }
+
+    if (showNotificationSettingsSheet) {
+        NotificationSettingsSheet(
+            settings = notificationSettings,
+            hasSystemPermission = hasNotificationPermission,
+            onRequestPermission = {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                    !NotificationChannels.hasNotificationPermission(context)
+                ) {
+                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                } else {
+                    val settingsIntent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                        putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                    }
+                    runCatching { context.startActivity(settingsIntent) }
+                        .onFailure {
+                            val fallback = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                                data = Uri.fromParts("package", context.packageName, null)
+                            }
+                            context.startActivity(fallback)
+                        }
+                }
+            },
+            onToggleReminders = { enabled ->
+                coroutineScope.launch {
+                    notificationPrefs.setRemindersEnabled(enabled)
+                    financeViewModel.resyncNotifications()
+                }
+            },
+            onToggleOneHourBefore = { enabled ->
+                coroutineScope.launch {
+                    notificationPrefs.setOneHourBeforeEnabled(enabled)
+                    financeViewModel.resyncNotifications()
+                }
+            },
+            onToggleDailySummary = { enabled ->
+                coroutineScope.launch { notificationPrefs.setDailySummaryEnabled(enabled) }
+            },
+            onToggleWeeklySummary = { enabled ->
+                coroutineScope.launch { notificationPrefs.setWeeklySummaryEnabled(enabled) }
+            },
+            onToggleGoals = { enabled ->
+                coroutineScope.launch { notificationPrefs.setGoalsEnabled(enabled) }
+            },
+            onSelectDailyTime = { h, m ->
+                coroutineScope.launch { notificationPrefs.setDailySummaryTime(h, m) }
+            },
+            onAddNickname = { nick ->
+                coroutineScope.launch { notificationPrefs.addNickname(nick) }
+            },
+            onRemoveNickname = { nick ->
+                coroutineScope.launch { notificationPrefs.removeNickname(nick) }
+            },
+            onResetNicknames = {
+                coroutineScope.launch { notificationPrefs.resetDefaultNicknames() }
+            },
+            onSendTestNotification = {
+                coroutineScope.launch {
+                    if (!NotificationChannels.hasNotificationPermission(context) &&
+                        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                    ) {
+                        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        return@launch
+                    }
+                    val posted = reminderScheduler.fireTestNotificationNow()
+                    if (posted) {
+                        snackbarHostState.showSnackbar("Notificação de teste enviada.")
+                    } else {
+                        snackbarHostState.showSnackbar("Ative as notificações nas permissões do sistema.")
+                    }
+                }
+            },
+            onDismiss = { showNotificationSettingsSheet = false },
         )
     }
 }
@@ -409,6 +652,8 @@ private fun AlfredScreenHost(
     onChatScopeChange: (FinanceScope) -> Unit,
     onNavigate: (String) -> Unit,
     onOpenQuickAdd: () -> Unit,
+    onOpenManualEntry: (ManualEntryDraft) -> Unit,
+    onOpenNotificationSettings: () -> Unit,
     onSignOut: () -> Unit,
     viewModel: FinanceViewModel,
     contentBottomPadding: androidx.compose.ui.unit.Dp,
@@ -441,11 +686,15 @@ private fun AlfredScreenHost(
                     viewModel.addAccount(FinanceScope.PERSONAL, name, kind, balance, limit)
                 },
                 onDeleteAccount = viewModel::deleteAccount,
-                onAddReminder = { title, amount, due ->
-                    viewModel.addReminder(FinanceScope.PERSONAL, title, amount, due)
+                onAddReminder = { title, amount, due, dueAt, recurrence, monthKey ->
+                    viewModel.addReminder(FinanceScope.PERSONAL, title, amount, due, dueAt, recurrence, monthKey)
+                },
+                onUpdateReminder = { id, title, amount, due, dueAt, recurrence, monthKey ->
+                    viewModel.updateReminder(id, title, amount, due, dueAt, recurrence, monthKey)
                 },
                 onToggleReminder = viewModel::toggleReminderCompleted,
                 onDeleteReminder = viewModel::deleteReminder,
+                onOpenNotificationSettings = onOpenNotificationSettings,
                 onSignOut = onSignOut,
                 contentBottomPadding = contentBottomPadding,
             )
@@ -472,11 +721,15 @@ private fun AlfredScreenHost(
                     viewModel.addAccount(FinanceScope.BUSINESS, name, kind, balance, limit)
                 },
                 onDeleteAccount = viewModel::deleteAccount,
-                onAddReminder = { title, amount, due ->
-                    viewModel.addReminder(FinanceScope.BUSINESS, title, amount, due)
+                onAddReminder = { title, amount, due, dueAt, recurrence, monthKey ->
+                    viewModel.addReminder(FinanceScope.BUSINESS, title, amount, due, dueAt, recurrence, monthKey)
+                },
+                onUpdateReminder = { id, title, amount, due, dueAt, recurrence, monthKey ->
+                    viewModel.updateReminder(id, title, amount, due, dueAt, recurrence, monthKey)
                 },
                 onToggleReminder = viewModel::toggleReminderCompleted,
                 onDeleteReminder = viewModel::deleteReminder,
+                onOpenNotificationSettings = onOpenNotificationSettings,
                 onSignOut = onSignOut,
                 contentBottomPadding = contentBottomPadding,
             )
@@ -489,6 +742,10 @@ private fun AlfredScreenHost(
                 onSendMessage = { text, bmp ->
                     viewModel.sendChatMessage(text, bmp, chatActiveScope)
                 },
+                onRequestWeeklySummary = {
+                    viewModel.requestWeeklySummary(chatActiveScope)
+                },
+                onOpenManualEntry = onOpenManualEntry,
                 onDismissError = viewModel::clearChatError,
                 contentBottomPadding = contentBottomPadding,
             )

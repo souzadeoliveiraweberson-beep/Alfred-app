@@ -9,7 +9,10 @@ import com.example.data.model.FinanceGoal
 import com.example.data.model.FinanceReminder
 import com.example.data.model.FinanceScope
 import com.example.data.model.FinanceTransaction
+import com.example.data.model.ReminderRecurrence
+import com.example.data.model.ReminderScheduleHelper
 import com.example.data.model.TransactionType
+import com.google.firebase.Timestamp
 import com.google.firebase.firestore.FirebaseFirestoreException
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -138,10 +141,58 @@ class FinanceRepositoryRuleTest : FirestoreEmulatorTestBase() {
             repository.updateGoalAmount(goalId, 12500.0)
         }
 
+        val dueMillis = System.currentTimeMillis() + 86_400_000L
+        val customId = "rem_custom_${java.util.UUID.randomUUID().toString().replace("-", "").take(12)}"
+        val timedReminderId = withTimeout(DEFAULT_TIMEOUT_MS) {
+            repository.addReminder(
+                FinanceReminder(
+                    scope = FinanceScope.PERSONAL.wireValue,
+                    title = "Aluguel recorrente",
+                    amount = 2200.0,
+                    dueDateText = "Amanhã, 09:00",
+                    dueAt = Timestamp(java.util.Date(dueMillis)),
+                    recurrence = ReminderRecurrence.MONTHLY.wireValue,
+                    monthKey = "2026-11",
+                ),
+                presetId = customId,
+            )
+        }
+        assertEquals(customId, timedReminderId)
+
+        val nextMillis = ReminderScheduleHelper.computeNextOccurrenceMillis(
+            dueMillis,
+            ReminderRecurrence.MONTHLY,
+        )!!
+        val nextId = ReminderScheduleHelper.deterministicNextOccurrenceId(timedReminderId, nextMillis)
+        withTimeout(DEFAULT_TIMEOUT_MS) {
+            repository.completeRecurringReminder(
+                reminder = FinanceReminder(
+                    id = timedReminderId,
+                    scope = FinanceScope.PERSONAL.wireValue,
+                    title = "Aluguel recorrente",
+                    amount = 2200.0,
+                    dueDateText = "Amanhã, 09:00",
+                    dueAt = Timestamp(java.util.Date(dueMillis)),
+                    recurrence = ReminderRecurrence.MONTHLY.wireValue,
+                    monthKey = "2026-11",
+                ),
+                nextOccurrenceId = nextId,
+                nextDueAt = Timestamp(java.util.Date(nextMillis)),
+                nextDueDateText = "17 Dez, 09:00",
+                nextMonthKey = "2026-12",
+            )
+        }
+
         val goals = withTimeout(FLOW_TIMEOUT_MS) {
             repository.observeGoals(aliceUid).first { list -> list.any { it.id == goalId && it.currentAmount == 12500.0 } }
         }
         assertTrue(goals.any { it.id == goalId })
+
+        val reminders = withTimeout(FLOW_TIMEOUT_MS) {
+            repository.observeReminders(aliceUid).first { list -> list.any { it.id == nextId } }
+        }
+        assertTrue(reminders.any { it.id == timedReminderId && it.isCompleted })
+        assertTrue(reminders.any { it.id == nextId && !it.isCompleted })
     }
 
     @Test

@@ -2,7 +2,9 @@ package com.example.data.model
 
 import com.google.firebase.Timestamp
 import com.google.firebase.firestore.DocumentId
+import com.google.firebase.firestore.Exclude
 import com.google.firebase.firestore.IgnoreExtraProperties
+import com.google.firebase.firestore.PropertyName
 import com.google.firebase.firestore.ServerTimestamp
 
 enum class FinanceScope(val wireValue: String, val labelPt: String) {
@@ -47,6 +49,18 @@ enum class ChatSender(val wireValue: String) {
     }
 }
 
+enum class ReminderRecurrence(val wireValue: String, val labelPt: String) {
+    NONE("NONE", "Único"),
+    DAILY("DAILY", "Diário"),
+    WEEKLY("WEEKLY", "Semanal"),
+    MONTHLY("MONTHLY", "Mensal");
+
+    companion object {
+        fun fromWire(value: String?): ReminderRecurrence =
+            entries.firstOrNull { it.wireValue.equals(value?.trim(), ignoreCase = true) } ?: NONE
+    }
+}
+
 @IgnoreExtraProperties
 data class FinanceTransaction(
     @DocumentId val id: String = "",
@@ -60,8 +74,8 @@ data class FinanceTransaction(
     val accountName: String = "Carteira",
     val monthKey: String = "",
     val dayOfMonth: Int = 1,
-    val isPaid: Boolean = true,
-    val isRecurring: Boolean = false,
+    @get:PropertyName("isPaid") val isPaid: Boolean = true,
+    @get:PropertyName("isRecurring") val isRecurring: Boolean = false,
     val notes: String = "",
     @ServerTimestamp val createdAt: Timestamp? = null,
     @ServerTimestamp val updatedAt: Timestamp? = null,
@@ -90,8 +104,10 @@ data class FinanceReminder(
     val title: String = "",
     val amount: Double = 0.0,
     val dueDateText: String = "",
+    val dueAt: Timestamp? = null,
+    val recurrence: String = ReminderRecurrence.NONE.wireValue,
     val monthKey: String = "",
-    val isCompleted: Boolean = false,
+    @get:PropertyName("isCompleted") val isCompleted: Boolean = false,
     @ServerTimestamp val createdAt: Timestamp? = null,
     @ServerTimestamp val updatedAt: Timestamp? = null,
 )
@@ -117,6 +133,7 @@ data class AlfredChatMessage(
     val text: String = "",
     val scope: String = FinanceScope.PERSONAL.wireValue,
     val actionSummary: String = "",
+    @get:Exclude val debugTtftMs: Long? = null,
     @ServerTimestamp val createdAt: Timestamp? = null,
     @ServerTimestamp val updatedAt: Timestamp? = null,
 )

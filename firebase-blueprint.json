@@ -58,6 +58,8 @@
         "title": { "type": "string" },
         "amount": { "type": "number" },
         "dueDateText": { "type": "string" },
+        "dueAt": { "type": "string", "format": "date-time", "description": "Optional exact reminder timestamp" },
+        "recurrence": { "type": "string", "enum": ["NONE", "DAILY", "WEEKLY", "MONTHLY"] },
         "monthKey": { "type": "string" },
         "isCompleted": { "type": "boolean" },
         "createdAt": { "type": "string", "format": "date-time" },

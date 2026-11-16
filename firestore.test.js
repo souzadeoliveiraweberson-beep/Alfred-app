@@ -243,6 +243,61 @@ test("Reminders, goals, and chat messages enforce ownership and schema", async (
       })
   );
 
+  await assertSucceeds(
+    aliceDb
+      .collection("users")
+      .doc(ALICE_UID)
+      .collection("reminders")
+      .doc("rem_with_due_at")
+      .set({
+        userId: ALICE_UID,
+        scope: "PERSONAL",
+        title: "Pagar internet",
+        amount: 120.0,
+        dueDateText: "19 Nov, 09:00",
+        dueAt: new Date(now.getTime() + 86400000),
+        recurrence: "MONTHLY",
+        monthKey: "2026-11",
+        isCompleted: false,
+        createdAt: now,
+        updatedAt: now,
+      })
+  );
+
+  await assertSucceeds(
+    aliceDb
+      .collection("users")
+      .doc(ALICE_UID)
+      .collection("reminders")
+      .doc("rem_with_due_at")
+      .update({
+        dueDateText: "20 Nov, 14:00",
+        dueAt: new Date(now.getTime() + 2 * 86400000),
+        recurrence: "WEEKLY",
+        updatedAt: new Date(),
+      })
+  );
+
+  await assertFails(
+    aliceDb
+      .collection("users")
+      .doc(ALICE_UID)
+      .collection("reminders")
+      .doc("rem_bad_rec")
+      .set({
+        userId: ALICE_UID,
+        scope: "PERSONAL",
+        title: "Teste inválido",
+        amount: 50.0,
+        dueDateText: "Amanhã",
+        recurrence: "HOURLY",
+        monthKey: "2026-11",
+        isCompleted: false,
+        createdAt: now,
+        updatedAt: now,
+      })
+  );
+
   const bobDb = testEnv.authenticatedContext(BOB_UID).firestore();
   await assertFails(
     bobDb.collection("users").doc(ALICE_UID).collection("chatMessages").get()

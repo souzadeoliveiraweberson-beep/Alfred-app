@@ -7,6 +7,7 @@ import com.example.data.model.FinanceAccount
 import com.example.data.model.FinanceGoal
 import com.example.data.model.FinanceReminder
 import com.example.data.model.FinanceTransaction
+import com.example.data.model.ReminderRecurrence
 import com.example.data.remote.OperationType
 import com.example.data.remote.handleFirestoreError
 import com.google.firebase.Firebase
@@ -20,10 +21,12 @@ import com.google.firebase.firestore.FirebaseFirestoreException
 import com.google.firebase.firestore.Query
 import com.google.firebase.firestore.snapshots
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withTimeout
 
 class FinanceRepository(
     private val db: FirebaseFirestore,
@@ -42,6 +45,11 @@ class FinanceRepository(
     }
 
     private fun userRoot(userId: String) = db.collection("users").document(userId)
+
+    fun generateDocumentId(collectionName: String): String {
+        val uid = requireUserId()
+        return userRoot(uid).collection(collectionName).document().id
+    }
 
     private fun <T> Flow<T>.logFirestoreErrors(
         userId: String,
@@ -145,9 +153,36 @@ class FinanceRepository(
         }
     }
 
-    suspend fun addTransaction(tx: FinanceTransaction): String {
+    private suspend inline fun <T> executeWrite(
+        operationType: OperationType,
+        path: String,
+        crossinline block: suspend () -> T,
+    ): T {
+        return try {
+            withTimeout(WRITE_TIMEOUT_MS) {
+                block()
+            }
+        } catch (e: TimeoutCancellationException) {
+            throw IllegalStateException(
+                "Tempo limite de 15s ao sincronizar escrita no Firestore ($path).",
+                e
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, operationType, path)
+            throw e
+        }
+    }
+
+    suspend fun addTransaction(tx: FinanceTransaction, presetId: String? = null): String {
         val uid = requireUserId()
-        val docRef = userRoot(uid).collection("transactions").document()
+        val effectiveId = presetId?.takeIf { it.isNotBlank() } ?: tx.id.takeIf { it.isNotBlank() }
+        val docRef = if (effectiveId != null) {
+            userRoot(uid).collection("transactions").document(effectiveId)
+        } else {
+            userRoot(uid).collection("transactions").document()
+        }
         val payload = mapOf(
             "userId" to uid,
             "scope" to tx.scope,
@@ -165,45 +200,30 @@ class FinanceRepository(
             "createdAt" to FieldValue.serverTimestamp(),
             "updatedAt" to FieldValue.serverTimestamp(),
         )
-        try {
+        return executeWrite(OperationType.CREATE, docRef.path) {
             docRef.set(payload).await()
-            return docRef.id
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.CREATE, docRef.path)
-            throw e
+            docRef.id
         }
     }
 
     suspend fun toggleTransactionPaid(transactionId: String, isPaid: Boolean) {
         val uid = requireUserId()
         val docRef = userRoot(uid).collection("transactions").document(transactionId)
-        try {
+        executeWrite(OperationType.UPDATE, docRef.path) {
             docRef.update(
                 mapOf(
                     "isPaid" to isPaid,
                     "updatedAt" to FieldValue.serverTimestamp(),
                 )
             ).await()
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.UPDATE, docRef.path)
-            throw e
         }
     }
 
     suspend fun deleteTransaction(transactionId: String) {
         val uid = requireUserId()
         val docRef = userRoot(uid).collection("transactions").document(transactionId)
-        try {
+        executeWrite(OperationType.DELETE, docRef.path) {
             docRef.delete().await()
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.DELETE, docRef.path)
-            throw e
         }
     }
 
@@ -222,107 +242,153 @@ class FinanceRepository(
             "createdAt" to FieldValue.serverTimestamp(),
             "updatedAt" to FieldValue.serverTimestamp(),
         )
-        try {
+        return executeWrite(OperationType.CREATE, docRef.path) {
             docRef.set(payload).await()
-            return docRef.id
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.CREATE, docRef.path)
-            throw e
+            docRef.id
         }
     }
 
     suspend fun updateAccountBalance(accountId: String, newBalance: Double) {
         val uid = requireUserId()
         val docRef = userRoot(uid).collection("accounts").document(accountId)
-        try {
+        executeWrite(OperationType.UPDATE, docRef.path) {
             docRef.update(
                 mapOf(
                     "balance" to newBalance,
                     "updatedAt" to FieldValue.serverTimestamp(),
                 )
             ).await()
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.UPDATE, docRef.path)
-            throw e
         }
     }
 
     suspend fun deleteAccount(accountId: String) {
         val uid = requireUserId()
         val docRef = userRoot(uid).collection("accounts").document(accountId)
-        try {
+        executeWrite(OperationType.DELETE, docRef.path) {
             docRef.delete().await()
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.DELETE, docRef.path)
-            throw e
         }
     }
 
-    suspend fun addReminder(reminder: FinanceReminder): String {
+    suspend fun addReminder(reminder: FinanceReminder, presetId: String? = null): String {
         val uid = requireUserId()
-        val docRef = userRoot(uid).collection("reminders").document()
-        val payload = mapOf(
-            "userId" to uid,
-            "scope" to reminder.scope,
-            "title" to reminder.title.trim().take(120),
-            "amount" to reminder.amount.coerceAtLeast(0.0),
-            "dueDateText" to reminder.dueDateText.trim().ifBlank { "Hoje" }.take(40),
-            "monthKey" to reminder.monthKey,
-            "isCompleted" to reminder.isCompleted,
-            "createdAt" to FieldValue.serverTimestamp(),
+        val effectiveId = presetId?.takeIf { it.isNotBlank() } ?: reminder.id.takeIf { it.isNotBlank() }
+        val docRef = if (effectiveId != null) {
+            userRoot(uid).collection("reminders").document(effectiveId)
+        } else {
+            userRoot(uid).collection("reminders").document()
+        }
+        val payload = buildMap<String, Any> {
+            put("userId", uid)
+            put("scope", reminder.scope)
+            put("title", reminder.title.trim().take(120))
+            put("amount", reminder.amount.coerceAtLeast(0.0))
+            put("dueDateText", reminder.dueDateText.trim().ifBlank { "Em breve" }.take(40))
+            put("monthKey", reminder.monthKey)
+            put("isCompleted", reminder.isCompleted)
+            put("recurrence", ReminderRecurrence.fromWire(reminder.recurrence).wireValue)
+            if (reminder.dueAt != null) {
+                put("dueAt", reminder.dueAt)
+            }
+            put("createdAt", FieldValue.serverTimestamp())
+            put("updatedAt", FieldValue.serverTimestamp())
+        }
+        return executeWrite(OperationType.CREATE, docRef.path) {
+            docRef.set(payload).await()
+            docRef.id
+        }
+    }
+
+    suspend fun updateReminder(
+        reminderId: String,
+        title: String,
+        amount: Double,
+        dueDateText: String,
+        dueAt: Timestamp?,
+        recurrence: String,
+        monthKey: String,
+    ) {
+        val uid = requireUserId()
+        val docRef = userRoot(uid).collection("reminders").document(reminderId)
+        val updates = mutableMapOf<String, Any?>(
+            "title" to title.trim().take(120),
+            "amount" to amount.coerceAtLeast(0.0),
+            "dueDateText" to dueDateText.trim().ifBlank { "Em breve" }.take(40),
+            "recurrence" to ReminderRecurrence.fromWire(recurrence).wireValue,
+            "monthKey" to monthKey,
+            "dueAt" to dueAt,
             "updatedAt" to FieldValue.serverTimestamp(),
         )
-        try {
-            docRef.set(payload).await()
-            return docRef.id
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.CREATE, docRef.path)
-            throw e
+        executeWrite(OperationType.UPDATE, docRef.path) {
+            docRef.update(updates).await()
         }
     }
 
     suspend fun toggleReminderCompleted(reminderId: String, isCompleted: Boolean) {
         val uid = requireUserId()
         val docRef = userRoot(uid).collection("reminders").document(reminderId)
-        try {
+        executeWrite(OperationType.UPDATE, docRef.path) {
             docRef.update(
                 mapOf(
                     "isCompleted" to isCompleted,
                     "updatedAt" to FieldValue.serverTimestamp(),
                 )
             ).await()
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.UPDATE, docRef.path)
-            throw e
+        }
+    }
+
+    suspend fun completeRecurringReminder(
+        reminder: FinanceReminder,
+        nextOccurrenceId: String,
+        nextDueAt: Timestamp,
+        nextDueDateText: String,
+        nextMonthKey: String,
+    ) {
+        val uid = requireUserId()
+        val currentRef = userRoot(uid).collection("reminders").document(reminder.id)
+        val nextRef = userRoot(uid).collection("reminders").document(nextOccurrenceId)
+        val nextPayload = mapOf(
+            "userId" to uid,
+            "scope" to reminder.scope,
+            "title" to reminder.title.trim().take(120),
+            "amount" to reminder.amount.coerceAtLeast(0.0),
+            "dueDateText" to nextDueDateText.trim().ifBlank { "Em breve" }.take(40),
+            "dueAt" to nextDueAt,
+            "recurrence" to ReminderRecurrence.fromWire(reminder.recurrence).wireValue,
+            "monthKey" to nextMonthKey,
+            "isCompleted" to false,
+            "createdAt" to FieldValue.serverTimestamp(),
+            "updatedAt" to FieldValue.serverTimestamp(),
+        )
+        executeWrite(OperationType.UPDATE, currentRef.path) {
+            db.runBatch { batch ->
+                batch.update(
+                    currentRef,
+                    mapOf(
+                        "isCompleted" to true,
+                        "updatedAt" to FieldValue.serverTimestamp(),
+                    )
+                )
+                batch.set(nextRef, nextPayload)
+            }.await()
         }
     }
 
     suspend fun deleteReminder(reminderId: String) {
         val uid = requireUserId()
         val docRef = userRoot(uid).collection("reminders").document(reminderId)
-        try {
+        executeWrite(OperationType.DELETE, docRef.path) {
             docRef.delete().await()
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.DELETE, docRef.path)
-            throw e
         }
     }
 
-    suspend fun addGoal(goal: FinanceGoal): String {
+    suspend fun addGoal(goal: FinanceGoal, presetId: String? = null): String {
         val uid = requireUserId()
-        val docRef = userRoot(uid).collection("goals").document()
+        val effectiveId = presetId?.takeIf { it.isNotBlank() } ?: goal.id.takeIf { it.isNotBlank() }
+        val docRef = if (effectiveId != null) {
+            userRoot(uid).collection("goals").document(effectiveId)
+        } else {
+            userRoot(uid).collection("goals").document()
+        }
         val payload = mapOf(
             "userId" to uid,
             "scope" to goal.scope,
@@ -333,68 +399,57 @@ class FinanceRepository(
             "createdAt" to FieldValue.serverTimestamp(),
             "updatedAt" to FieldValue.serverTimestamp(),
         )
-        try {
+        return executeWrite(OperationType.CREATE, docRef.path) {
             docRef.set(payload).await()
-            return docRef.id
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.CREATE, docRef.path)
-            throw e
+            docRef.id
         }
     }
 
     suspend fun updateGoalAmount(goalId: String, newCurrentAmount: Double) {
         val uid = requireUserId()
         val docRef = userRoot(uid).collection("goals").document(goalId)
-        try {
+        executeWrite(OperationType.UPDATE, docRef.path) {
             docRef.update(
                 mapOf(
                     "currentAmount" to newCurrentAmount.coerceAtLeast(0.0),
                     "updatedAt" to FieldValue.serverTimestamp(),
                 )
             ).await()
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.UPDATE, docRef.path)
-            throw e
         }
     }
 
     suspend fun deleteGoal(goalId: String) {
         val uid = requireUserId()
         val docRef = userRoot(uid).collection("goals").document(goalId)
-        try {
+        executeWrite(OperationType.DELETE, docRef.path) {
             docRef.delete().await()
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.DELETE, docRef.path)
-            throw e
         }
     }
 
-    suspend fun addChatMessage(message: AlfredChatMessage): String {
+    suspend fun addChatMessage(message: AlfredChatMessage, presetId: String? = null): String {
         val uid = requireUserId()
-        val docRef = userRoot(uid).collection("chatMessages").document()
+        val effectiveId = presetId?.takeIf { it.isNotBlank() }
+        val docRef = if (effectiveId != null) {
+            userRoot(uid).collection("chatMessages").document(effectiveId)
+        } else {
+            userRoot(uid).collection("chatMessages").document()
+        }
         val payload = mapOf(
             "userId" to uid,
             "sender" to message.sender,
             "text" to message.text.trim().take(4000),
             "scope" to message.scope,
-            "actionSummary" to message.actionSummary.trim().take(240),
+            "actionSummary" to message.actionSummary.trim().take(600),
             "createdAt" to FieldValue.serverTimestamp(),
             "updatedAt" to FieldValue.serverTimestamp(),
         )
-        try {
+        return executeWrite(OperationType.CREATE, docRef.path) {
             docRef.set(payload).await()
-            return docRef.id
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.CREATE, docRef.path)
-            throw e
+            docRef.id
         }
+    }
+
+    private companion object {
+        const val WRITE_TIMEOUT_MS = 15_000L
     }
 }
