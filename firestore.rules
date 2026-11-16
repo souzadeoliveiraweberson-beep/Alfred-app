@@ -1,0 +1,244 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidScope(scope) {
+      return scope is string && scope in ['PERSONAL', 'BUSINESS'];
+    }
+
+    function isValidTransaction(data, userId) {
+      return data.userId == userId &&
+        isValidScope(data.scope) &&
+        data.type is string && data.type in ['INCOME', 'EXPENSE'] &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 120 &&
+        data.category is string && data.category.size() >= 1 && data.category.size() <= 60 &&
+        data.amount is number && data.amount > 0 && data.amount <= 1000000000 &&
+        data.accountId is string && data.accountId.size() <= 128 &&
+        data.accountName is string && data.accountName.size() <= 80 &&
+        data.monthKey is string && data.monthKey.size() == 7 &&
+        data.dayOfMonth is int && data.dayOfMonth >= 1 && data.dayOfMonth <= 31 &&
+        data.isPaid is bool &&
+        data.isRecurring is bool &&
+        data.notes is string && data.notes.size() <= 300;
+    }
+
+    function isValidAccount(data, userId) {
+      return data.userId == userId &&
+        isValidScope(data.scope) &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 60 &&
+        data.kind is string && data.kind in ['CHECKING', 'CREDIT_CARD', 'SAVINGS', 'BUSINESS_CASH'] &&
+        data.balance is number && data.balance >= -1000000000 && data.balance <= 1000000000 &&
+        data.creditLimit is number && data.creditLimit >= 0 && data.creditLimit <= 1000000000 &&
+        data.closingDay is int && data.closingDay >= 1 && data.closingDay <= 31 &&
+        data.dueDay is int && data.dueDay >= 1 && data.dueDay <= 31;
+    }
+
+    function isValidReminder(data, userId) {
+      return data.userId == userId &&
+        isValidScope(data.scope) &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 120 &&
+        data.amount is number && data.amount >= 0 && data.amount <= 1000000000 &&
+        data.dueDateText is string && data.dueDateText.size() >= 1 && data.dueDateText.size() <= 40 &&
+        data.monthKey is string && data.monthKey.size() == 7 &&
+        data.isCompleted is bool;
+    }
+
+    function isValidGoal(data, userId) {
+      return data.userId == userId &&
+        isValidScope(data.scope) &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 80 &&
+        data.targetAmount is number && data.targetAmount > 0 && data.targetAmount <= 1000000000 &&
+        data.currentAmount is number && data.currentAmount >= 0 && data.currentAmount <= 1000000000 &&
+        data.deadlineText is string && data.deadlineText.size() <= 40;
+    }
+
+    function isValidChatMessage(data, userId) {
+      return data.userId == userId &&
+        data.sender is string && data.sender in ['USER', 'ALFRED'] &&
+        data.text is string && data.text.size() >= 1 && data.text.size() <= 4000 &&
+        isValidScope(data.scope) &&
+        data.actionSummary is string && data.actionSummary.size() <= 240;
+    }
+
+    match /users/{userId}/transactions/{transactionId} {
+      allow list: if isOwner(userId);
+      allow get: if isOwner(userId) && isValidId(transactionId);
+      allow create: if isOwner(userId) &&
+        isValidId(transactionId) &&
+        incoming().keys().hasAll([
+          'userId', 'scope', 'type', 'title', 'category', 'amount',
+          'accountId', 'accountName', 'monthKey', 'dayOfMonth',
+          'isPaid', 'isRecurring', 'notes', 'createdAt', 'updatedAt'
+        ]) &&
+        incoming().keys().hasOnly([
+          'userId', 'scope', 'type', 'title', 'category', 'amount',
+          'accountId', 'accountName', 'monthKey', 'dayOfMonth',
+          'isPaid', 'isRecurring', 'notes', 'createdAt', 'updatedAt'
+        ]) &&
+        incoming().createdAt is timestamp && incoming().createdAt <= request.time &&
+        incoming().updatedAt is timestamp && incoming().updatedAt <= request.time &&
+        isValidTransaction(incoming(), userId);
+
+      allow update: if isOwner(userId) &&
+        isValidId(transactionId) &&
+        isValidTransaction(incoming(), userId) &&
+        incoming().userId == existing().userId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt is timestamp && incoming().updatedAt <= request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'scope', 'type', 'title', 'category', 'amount',
+          'accountId', 'accountName', 'monthKey', 'dayOfMonth',
+          'isPaid', 'isRecurring', 'notes', 'updatedAt'
+        ]);
+
+      allow delete: if isOwner(userId) && isValidId(transactionId);
+    }
+
+    match /users/{userId}/accounts/{accountId} {
+      allow list: if isOwner(userId);
+      allow get: if isOwner(userId) && isValidId(accountId);
+      allow create: if isOwner(userId) &&
+        isValidId(accountId) &&
+        incoming().keys().hasAll([
+          'userId', 'scope', 'name', 'kind', 'balance',
+          'creditLimit', 'closingDay', 'dueDay', 'createdAt', 'updatedAt'
+        ]) &&
+        incoming().keys().hasOnly([
+          'userId', 'scope', 'name', 'kind', 'balance',
+          'creditLimit', 'closingDay', 'dueDay', 'createdAt', 'updatedAt'
+        ]) &&
+        incoming().createdAt is timestamp && incoming().createdAt <= request.time &&
+        incoming().updatedAt is timestamp && incoming().updatedAt <= request.time &&
+        isValidAccount(incoming(), userId);
+
+      allow update: if isOwner(userId) &&
+        isValidId(accountId) &&
+        isValidAccount(incoming(), userId) &&
+        incoming().userId == existing().userId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt is timestamp && incoming().updatedAt <= request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'scope', 'name', 'kind', 'balance',
+          'creditLimit', 'closingDay', 'dueDay', 'updatedAt'
+        ]);
+
+      allow delete: if isOwner(userId) && isValidId(accountId);
+    }
+
+    match /users/{userId}/reminders/{reminderId} {
+      allow list: if isOwner(userId);
+      allow get: if isOwner(userId) && isValidId(reminderId);
+      allow create: if isOwner(userId) &&
+        isValidId(reminderId) &&
+        incoming().keys().hasAll([
+          'userId', 'scope', 'title', 'amount', 'dueDateText',
+          'monthKey', 'isCompleted', 'createdAt', 'updatedAt'
+        ]) &&
+        incoming().keys().hasOnly([
+          'userId', 'scope', 'title', 'amount', 'dueDateText',
+          'monthKey', 'isCompleted', 'createdAt', 'updatedAt'
+        ]) &&
+        incoming().createdAt is timestamp && incoming().createdAt <= request.time &&
+        incoming().updatedAt is timestamp && incoming().updatedAt <= request.time &&
+        isValidReminder(incoming(), userId);
+
+      allow update: if isOwner(userId) &&
+        isValidId(reminderId) &&
+        isValidReminder(incoming(), userId) &&
+        incoming().userId == existing().userId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt is timestamp && incoming().updatedAt <= request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'scope', 'title', 'amount', 'dueDateText',
+          'monthKey', 'isCompleted', 'updatedAt'
+        ]);
+
+      allow delete: if isOwner(userId) && isValidId(reminderId);
+    }
+
+    match /users/{userId}/goals/{goalId} {
+      allow list: if isOwner(userId);
+      allow get: if isOwner(userId) && isValidId(goalId);
+      allow create: if isOwner(userId) &&
+        isValidId(goalId) &&
+        incoming().keys().hasAll([
+          'userId', 'scope', 'title', 'targetAmount',
+          'currentAmount', 'deadlineText', 'createdAt', 'updatedAt'
+        ]) &&
+        incoming().keys().hasOnly([
+          'userId', 'scope', 'title', 'targetAmount',
+          'currentAmount', 'deadlineText', 'createdAt', 'updatedAt'
+        ]) &&
+        incoming().createdAt is timestamp && incoming().createdAt <= request.time &&
+        incoming().updatedAt is timestamp && incoming().updatedAt <= request.time &&
+        isValidGoal(incoming(), userId);
+
+      allow update: if isOwner(userId) &&
+        isValidId(goalId) &&
+        isValidGoal(incoming(), userId) &&
+        incoming().userId == existing().userId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt is timestamp && incoming().updatedAt <= request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'scope', 'title', 'targetAmount',
+          'currentAmount', 'deadlineText', 'updatedAt'
+        ]);
+
+      allow delete: if isOwner(userId) && isValidId(goalId);
+    }
+
+    match /users/{userId}/chatMessages/{messageId} {
+      allow list: if isOwner(userId);
+      allow get: if isOwner(userId) && isValidId(messageId);
+      allow create: if isOwner(userId) &&
+        isValidId(messageId) &&
+        incoming().keys().hasAll([
+          'userId', 'sender', 'text', 'scope',
+          'actionSummary', 'createdAt', 'updatedAt'
+        ]) &&
+        incoming().keys().hasOnly([
+          'userId', 'sender', 'text', 'scope',
+          'actionSummary', 'createdAt', 'updatedAt'
+        ]) &&
+        incoming().createdAt is timestamp && incoming().createdAt <= request.time &&
+        incoming().updatedAt is timestamp && incoming().updatedAt <= request.time &&
+        isValidChatMessage(incoming(), userId);
+
+      allow update: if isOwner(userId) &&
+        isValidId(messageId) &&
+        isValidChatMessage(incoming(), userId) &&
+        incoming().userId == existing().userId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt is timestamp && incoming().updatedAt <= request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'text', 'scope', 'actionSummary', 'updatedAt'
+        ]);
+
+      allow delete: if isOwner(userId) && isValidId(messageId);
+    }
+  }
+}

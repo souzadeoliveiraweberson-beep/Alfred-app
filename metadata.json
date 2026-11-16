@@ -1,0 +1,6 @@
+{
+  "name": "Alfred",
+  "description": "Assistente financeiro pessoal e empresarial com IA, voz e design Gotham minimalista.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

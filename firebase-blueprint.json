@@ -1,0 +1,131 @@
+{
+  "entities": {
+    "Transaction": {
+      "title": "Transaction",
+      "description": "A personal or business financial transaction (income or expense) owned by a user.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "Authenticated owner UID" },
+        "scope": { "type": "string", "enum": ["PERSONAL", "BUSINESS"], "description": "Financial workspace scope" },
+        "type": { "type": "string", "enum": ["INCOME", "EXPENSE"], "description": "Cashflow direction" },
+        "title": { "type": "string", "description": "Short description of transaction" },
+        "category": { "type": "string", "description": "Category label" },
+        "amount": { "type": "number", "description": "Positive monetary amount in BRL" },
+        "accountId": { "type": "string", "description": "Optional linked account or card ID" },
+        "accountName": { "type": "string", "description": "Display label of account or payment method" },
+        "monthKey": { "type": "string", "description": "Month key in YYYY-MM format" },
+        "dayOfMonth": { "type": "integer", "description": "Day of month (1-31)" },
+        "isPaid": { "type": "boolean", "description": "Whether settled/paid" },
+        "isRecurring": { "type": "boolean", "description": "Whether recurring monthly" },
+        "notes": { "type": "string", "description": "Optional notes" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Server timestamp on creation" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Server timestamp on update" }
+      },
+      "required": [
+        "userId", "scope", "type", "title", "category", "amount",
+        "accountId", "accountName", "monthKey", "dayOfMonth",
+        "isPaid", "isRecurring", "notes", "createdAt", "updatedAt"
+      ]
+    },
+    "Account": {
+      "title": "Account",
+      "description": "A personal or business bank account, cash reserve, or credit card.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "scope": { "type": "string", "enum": ["PERSONAL", "BUSINESS"] },
+        "name": { "type": "string" },
+        "kind": { "type": "string", "enum": ["CHECKING", "CREDIT_CARD", "SAVINGS", "BUSINESS_CASH"] },
+        "balance": { "type": "number" },
+        "creditLimit": { "type": "number" },
+        "closingDay": { "type": "integer" },
+        "dueDay": { "type": "integer" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "userId", "scope", "name", "kind", "balance",
+        "creditLimit", "closingDay", "dueDay", "createdAt", "updatedAt"
+      ]
+    },
+    "Reminder": {
+      "title": "Reminder",
+      "description": "A bill payment reminder or financial alert scoped to personal or business.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "scope": { "type": "string", "enum": ["PERSONAL", "BUSINESS"] },
+        "title": { "type": "string" },
+        "amount": { "type": "number" },
+        "dueDateText": { "type": "string" },
+        "monthKey": { "type": "string" },
+        "isCompleted": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "userId", "scope", "title", "amount", "dueDateText",
+        "monthKey", "isCompleted", "createdAt", "updatedAt"
+      ]
+    },
+    "Goal": {
+      "title": "Goal",
+      "description": "A savings goal or business reserve target.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "scope": { "type": "string", "enum": ["PERSONAL", "BUSINESS"] },
+        "title": { "type": "string" },
+        "targetAmount": { "type": "number" },
+        "currentAmount": { "type": "number" },
+        "deadlineText": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "userId", "scope", "title", "targetAmount",
+        "currentAmount", "deadlineText", "createdAt", "updatedAt"
+      ]
+    },
+    "ChatMessage": {
+      "title": "ChatMessage",
+      "description": "A conversational message between the user and Alfred AI.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "sender": { "type": "string", "enum": ["USER", "ALFRED"] },
+        "text": { "type": "string" },
+        "scope": { "type": "string", "enum": ["PERSONAL", "BUSINESS"] },
+        "actionSummary": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "userId", "sender", "text", "scope",
+        "actionSummary", "createdAt", "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/transactions/{transactionId}": {
+      "schema": { "$ref": "#/entities/Transaction" },
+      "description": "User-scoped personal and business transactions."
+    },
+    "/users/{userId}/accounts/{accountId}": {
+      "schema": { "$ref": "#/entities/Account" },
+      "description": "User-scoped bank accounts, cash accounts, and credit cards."
+    },
+    "/users/{userId}/reminders/{reminderId}": {
+      "schema": { "$ref": "#/entities/Reminder" },
+      "description": "User-scoped bill reminders and upcoming alerts."
+    },
+    "/users/{userId}/goals/{goalId}": {
+      "schema": { "$ref": "#/entities/Goal" },
+      "description": "User-scoped savings goals and business reserves."
+    },
+    "/users/{userId}/chatMessages/{messageId}": {
+      "schema": { "$ref": "#/entities/ChatMessage" },
+      "description": "User-scoped Alfred AI conversation log."
+    }
+  }
+}
