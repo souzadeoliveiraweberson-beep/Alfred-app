@@ -66,7 +66,9 @@ service cloud.firestore {
         data.monthKey is string && data.monthKey.size() == 7 &&
         data.isCompleted is bool &&
         (!('dueAt' in data) || data.dueAt == null || data.dueAt is timestamp) &&
-        (!('recurrence' in data) || (data.recurrence is string && data.recurrence in ['NONE', 'DAILY', 'WEEKLY', 'MONTHLY']));
+        (!('recurrence' in data) || (data.recurrence is string && data.recurrence in ['NONE', 'DAILY', 'WEEKLY', 'MONTHLY'])) &&
+        (!('anchorDay' in data) || (data.anchorDay is int && data.anchorDay >= 0 && data.anchorDay <= 31)) &&
+        (!('generatedNextId' in data) || (data.generatedNextId is string && data.generatedNextId.size() <= 128));
     }
 
     function isValidGoal(data, userId) {
@@ -162,7 +164,8 @@ service cloud.firestore {
         ]) &&
         incoming().keys().hasOnly([
           'userId', 'scope', 'title', 'amount', 'dueDateText',
-          'dueAt', 'recurrence', 'monthKey', 'isCompleted', 'createdAt', 'updatedAt'
+          'dueAt', 'recurrence', 'monthKey', 'anchorDay', 'generatedNextId',
+          'isCompleted', 'createdAt', 'updatedAt'
         ]) &&
         incoming().createdAt is timestamp && incoming().createdAt <= request.time &&
         incoming().updatedAt is timestamp && incoming().updatedAt <= request.time &&
@@ -176,7 +179,8 @@ service cloud.firestore {
         incoming().updatedAt is timestamp && incoming().updatedAt <= request.time &&
         incoming().diff(existing()).affectedKeys().hasOnly([
           'scope', 'title', 'amount', 'dueDateText',
-          'dueAt', 'recurrence', 'monthKey', 'isCompleted', 'updatedAt'
+          'dueAt', 'recurrence', 'monthKey', 'anchorDay', 'generatedNextId',
+          'isCompleted', 'updatedAt'
         ]);
 
       allow delete: if isOwner(userId) && isValidId(reminderId);

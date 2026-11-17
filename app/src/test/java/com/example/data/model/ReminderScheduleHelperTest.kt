@@ -80,4 +80,43 @@ class ReminderScheduleHelperTest {
         assertEquals(id1, id2)
         assertEquals("rem_abc_next_202612161400", id1)
     }
+
+    @Test
+    fun computeNextOccurrenceMillis_skipsMissedCyclesIntoTheFuture() {
+        val originalDue = ZonedDateTime.of(2026, 10, 1, 9, 0, 0, 0, spZone).toInstant().toEpochMilli()
+        val lateCompletionNow = ZonedDateTime.of(2026, 11, 18, 12, 0, 0, 0, spZone).toInstant().toEpochMilli()
+
+        val nextMillis = ReminderScheduleHelper.computeNextOccurrenceMillis(
+            currentDueAtMillis = originalDue,
+            recurrence = ReminderRecurrence.WEEKLY,
+            zoneId = spZone,
+            nowMillis = lateCompletionNow,
+        )!!
+        assertTrue(nextMillis > lateCompletionNow)
+        val nextZoned = Instant.ofEpochMilli(nextMillis).atZone(spZone)
+        assertEquals(LocalDate.of(2026, 11, 19), nextZoned.toLocalDate())
+        assertEquals(LocalTime.of(9, 0), nextZoned.toLocalTime())
+    }
+
+    @Test
+    fun computeNextOccurrenceMillis_preservesAnchorDay31AcrossShortMonths() {
+        val jan31 = ZonedDateTime.of(2026, 1, 31, 10, 0, 0, 0, spZone).toInstant().toEpochMilli()
+        val febMillis = ReminderScheduleHelper.computeNextOccurrenceMillis(
+            currentDueAtMillis = jan31,
+            recurrence = ReminderRecurrence.MONTHLY,
+            zoneId = spZone,
+            anchorDayOfMonth = 31,
+        )!!
+        val febZoned = Instant.ofEpochMilli(febMillis).atZone(spZone)
+        assertEquals(LocalDate.of(2026, 2, 28), febZoned.toLocalDate())
+
+        val marMillis = ReminderScheduleHelper.computeNextOccurrenceMillis(
+            currentDueAtMillis = febMillis,
+            recurrence = ReminderRecurrence.MONTHLY,
+            zoneId = spZone,
+            anchorDayOfMonth = 31,
+        )!!
+        val marZoned = Instant.ofEpochMilli(marMillis).atZone(spZone)
+        assertEquals(LocalDate.of(2026, 3, 31), marZoned.toLocalDate())
+    }
 }

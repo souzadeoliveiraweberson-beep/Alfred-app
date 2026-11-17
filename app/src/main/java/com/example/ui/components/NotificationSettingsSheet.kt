@@ -17,11 +17,15 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import android.os.Build
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.BatteryChargingFull
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.NotificationsActive
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Schedule
 import androidx.compose.material.icons.rounded.WarningAmber
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -72,7 +76,12 @@ import java.util.Locale
 fun NotificationSettingsSheet(
     settings: NotificationSettings,
     hasSystemPermission: Boolean,
+    canScheduleExactAlarms: Boolean = true,
+    isIgnoringBatteryOptimizations: Boolean = true,
     onRequestPermission: () -> Unit,
+    onRequestExactAlarms: () -> Unit = {},
+    onRequestBatteryOptimization: () -> Unit = {},
+    onRequestAddQuickSettingsTile: (() -> Unit)? = null,
     onToggleReminders: (Boolean) -> Unit,
     onToggleOneHourBefore: (Boolean) -> Unit,
     onToggleDailySummary: (Boolean) -> Unit,
@@ -145,6 +154,47 @@ fun NotificationSettingsSheet(
                         }
                         TextButton(onClick = onRequestPermission) {
                             Text("Permitir", color = GothamPureWhite, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !canScheduleExactAlarms) {
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = GothamSurfaceElevated,
+                    border = BorderStroke(1.dp, GothamHairlineStrong),
+                    modifier = Modifier.testTag("exact_alarm_warning_card"),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Schedule,
+                            contentDescription = null,
+                            tint = GothamPureWhite,
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Alarmes exatos desativados",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = GothamPureWhite,
+                            )
+                            Text(
+                                text = "Permita alarmes e lembretes exatos para avisos e resumos no minuto certo.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = GothamSilver,
+                            )
+                        }
+                        TextButton(
+                            onClick = onRequestExactAlarms,
+                            modifier = Modifier.testTag("request_exact_alarm_button"),
+                        ) {
+                            Text("Autorizar", color = GothamPureWhite, fontWeight = FontWeight.Bold)
                         }
                     }
                 }
@@ -258,6 +308,104 @@ fun NotificationSettingsSheet(
                 onCheckedChange = onToggleGoals,
                 testTag = "toggle_goal_milestones",
             )
+
+            Surface(
+                shape = RoundedCornerShape(16.dp),
+                color = GothamSurface,
+                border = BorderStroke(1.dp, GothamHairline),
+                modifier = Modifier.testTag("battery_optimization_card"),
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.BatteryChargingFull,
+                        contentDescription = null,
+                        tint = GothamPureWhite,
+                        modifier = Modifier.size(20.dp),
+                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Evitar que o Android durma o Alfred",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = GothamPureWhite,
+                        )
+                        Text(
+                            text = if (isIgnoringBatteryOptimizations) {
+                                "Liberado • sem restrição de bateria"
+                            } else {
+                                "Com economia ativa • pode atrasar lembretes e resumos"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (isIgnoringBatteryOptimizations) GothamPearl else GothamSilver,
+                        )
+                    }
+                    OutlinedButton(
+                        onClick = onRequestBatteryOptimization,
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, GothamHairlineStrong),
+                        modifier = Modifier.testTag("battery_optimization_button"),
+                    ) {
+                        Text(
+                            text = if (isIgnoringBatteryOptimizations) "Liberado" else "Liberar",
+                            color = GothamPureWhite,
+                            style = MaterialTheme.typography.labelMedium,
+                        )
+                    }
+                }
+            }
+
+            if (onRequestAddQuickSettingsTile != null) {
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = GothamSurface,
+                    border = BorderStroke(1.dp, GothamHairline),
+                    modifier = Modifier.testTag("quick_settings_tile_card"),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Mic,
+                            contentDescription = null,
+                            tint = GothamPureWhite,
+                            modifier = Modifier.size(20.dp),
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Atalho \"Falar com Alfred\" no Painel Rápido",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = GothamPureWhite,
+                            )
+                            Text(
+                                text = "Adicione um botão na barra de notificações para abrir o microfone na hora",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = GothamSilver,
+                            )
+                        }
+                        OutlinedButton(
+                            onClick = onRequestAddQuickSettingsTile,
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, GothamHairlineStrong),
+                            modifier = Modifier.testTag("add_quick_settings_tile_button"),
+                        ) {
+                            Text(
+                                text = "Adicionar",
+                                color = GothamPureWhite,
+                                style = MaterialTheme.typography.labelMedium,
+                            )
+                        }
+                    }
+                }
+            }
 
             HorizontalDivider(color = GothamHairline)
 

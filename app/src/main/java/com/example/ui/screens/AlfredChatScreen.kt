@@ -56,8 +56,12 @@ import androidx.compose.material.icons.automirrored.rounded.Send
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.Mic
+import androidx.compose.material.icons.rounded.RecordVoiceOver
 import androidx.compose.material.icons.rounded.Stop
+import androidx.compose.material.icons.rounded.VolumeOff
+import androidx.compose.material.icons.rounded.VolumeUp
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -89,6 +93,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.BuildConfig
 import com.example.R
 import com.example.data.model.AlfredChatMessage
@@ -107,6 +115,8 @@ import com.example.ui.theme.GothamSurface
 import com.example.ui.theme.GothamSurfaceElevated
 import com.example.ui.theme.GothamVoid
 import com.example.ui.viewmodel.ChatStatus
+import com.example.voice.AlfredVoiceController
+import kotlinx.coroutines.delay
 
 private val QUICK_PROMPTS = listOf(
     "Como melhorar o lucro da empresa?",
@@ -123,6 +133,12 @@ fun AlfredChatScreen(
     chatStatus: ChatStatus,
     activeScope: FinanceScope,
     onScopeChange: (FinanceScope) -> Unit,
+    voiceRepliesEnabled: Boolean = true,
+    continuousVoiceEnabled: Boolean = false,
+    onToggleVoiceReplies: (Boolean) -> Unit = {},
+    onToggleContinuousVoice: (Boolean) -> Unit = {},
+    pendingAutoVoice: Boolean = false,
+    onConsumeAutoVoice: () -> Unit = {},
     onSendMessage: (String, Bitmap?) -> Unit,
     onRequestWeeklySummary: () -> Unit,
     onOpenManualEntry: (ManualEntryDraft) -> Unit,
@@ -130,11 +146,19 @@ fun AlfredChatScreen(
     contentBottomPadding: Dp,
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     var inputText by remember { mutableStateOf("") }
     var attachedBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var isListening by remember { mutableStateOf(false) }
     var speechError by remember { mutableStateOf<String?>(null) }
+    var lastSentByVoice by remember { mutableStateOf(false) }
+    var pendingReplyVoiceTrigger by remember { mutableStateOf(false) }
+    var knownMessageCountOnStart by remember { mutableStateOf<Int?>(null) }
+    var lastSpokenMessageId by remember { mutableStateOf<String?>(null) }
     val listState = rememberLazyListState()
+
+    val voiceController = remember(context) { AlfredVoiceController(context.applicationContext) }
+    val isSpeaking by voiceController.isSpeaking.collectAsStateWithLifecycle()
 
     val photoPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia(),
@@ -152,10 +176,23 @@ fun AlfredChatScreen(
         }
     }
 
-    DisposableEffect(speechRecognizer) {
+    DisposableEffect(speechRecognizer, voiceController) {
         onDispose {
-            speechRecognizer?.destroy()
+            runCatching { speechRecognizer?.destroy() }
+            voiceController.shutdown()
         }
+    }
+
+    DisposableEffect(lifecycleOwner, speechRecognizer, voiceController) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) {
+                isListening = false
+                runCatching { speechRecognizer?.cancel() }
+                voiceController.stopSpeaking()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     val startVoiceCapture: () -> Unit = {
@@ -164,6 +201,7 @@ fun AlfredChatScreen(
             speechError = "Reconhecimento de voz indisponível neste dispositivo."
         } else {
             speechError = null
+            voiceController.stopSpeaking()
             recognizer.setRecognitionListener(object : RecognitionListener {
                 override fun onReadyForSpeech(params: Bundle?) {
                     isListening = true
@@ -178,7 +216,7 @@ fun AlfredChatScreen(
 
                 override fun onError(error: Int) {
                     isListening = false
-                    speechError = "Não foi possível captar a voz (código $error). Tente novamente."
+                    speechError = AlfredVoiceController.mapSpeechError(error)
                 }
 
                 override fun onResults(results: Bundle?) {
@@ -187,7 +225,18 @@ fun AlfredChatScreen(
                         ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         ?.firstOrNull()
                         .orEmpty()
+                        .trim()
                     if (spoken.isNotBlank()) {
+                        if (AlfredVoiceController.isStopVoicePhrase(spoken)) {
+                            lastSentByVoice = false
+                            pendingReplyVoiceTrigger = false
+                            onToggleContinuousVoice(false)
+                            voiceController.speak("Às suas ordens, senhor. Modo contínuo encerrado.")
+                            return
+                        }
+                        lastSentByVoice = true
+                        pendingReplyVoiceTrigger = true
+                        inputText = ""
                         onSendMessage(spoken, attachedBitmap)
                         attachedBitmap = null
                     }
@@ -209,7 +258,9 @@ fun AlfredChatScreen(
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE, "pt-BR")
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "pt-BR")
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
             }
             recognizer.startListening(intent)
         }
@@ -222,6 +273,57 @@ fun AlfredChatScreen(
             startVoiceCapture()
         } else {
             speechError = "Permissão de microfone negada. Você pode digitar normalmente."
+        }
+    }
+
+    val triggerMicAction: () -> Unit = {
+        if (isListening) {
+            runCatching { speechRecognizer?.stopListening() }
+            isListening = false
+        } else {
+            val granted = ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+            if (granted) {
+                startVoiceCapture()
+            } else {
+                audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            }
+        }
+    }
+
+    LaunchedEffect(pendingAutoVoice) {
+        if (pendingAutoVoice) {
+            onConsumeAutoVoice()
+            delay(180)
+            if (!isListening) {
+                triggerMicAction()
+            }
+        }
+    }
+
+    LaunchedEffect(messages.size) {
+        if (knownMessageCountOnStart == null) {
+            knownMessageCountOnStart = messages.size
+            lastSpokenMessageId = messages.lastOrNull { it.sender == ChatSender.ALFRED.wireValue }?.id
+            return@LaunchedEffect
+        }
+        val latest = messages.lastOrNull() ?: return@LaunchedEffect
+        if (latest.sender == ChatSender.ALFRED.wireValue && latest.id != lastSpokenMessageId) {
+            lastSpokenMessageId = latest.id
+            val shouldSpeak = voiceRepliesEnabled && (pendingReplyVoiceTrigger || lastSentByVoice || continuousVoiceEnabled)
+            val rearmMicAfterSpeak = continuousVoiceEnabled &&
+                (pendingReplyVoiceTrigger || lastSentByVoice) &&
+                ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+            pendingReplyVoiceTrigger = false
+            if (shouldSpeak) {
+                voiceController.speak(latest.text) {
+                    if (rearmMicAfterSpeak && !isListening) {
+                        startVoiceCapture()
+                    }
+                }
+            }
         }
     }
 
@@ -298,8 +400,37 @@ fun AlfredChatScreen(
                     }
                 }
 
-                // Active Scope Pill
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                // Voice toggles + Active Scope Pill
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Surface(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(CircleShape)
+                            .clickable {
+                                val next = !voiceRepliesEnabled
+                                onToggleVoiceReplies(next)
+                                if (!next) {
+                                    voiceController.stopSpeaking()
+                                }
+                            }
+                            .testTag("chat_voice_replies_toggle"),
+                        shape = CircleShape,
+                        color = if (voiceRepliesEnabled) GothamPureWhite else GothamSurface,
+                        border = BorderStroke(1.dp, if (voiceRepliesEnabled) GothamPureWhite else GothamHairline),
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = if (voiceRepliesEnabled) Icons.Rounded.VolumeUp else Icons.Rounded.VolumeOff,
+                                contentDescription = if (voiceRepliesEnabled) "Desativar voz do Alfred" else "Ativar voz do Alfred",
+                                tint = if (voiceRepliesEnabled) GothamVoid else GothamSilver,
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
+                    }
+
                     FinanceScope.entries.forEach { scopeOption ->
                         val selected = activeScope == scopeOption
                         Surface(
@@ -318,6 +449,85 @@ fun AlfredChatScreen(
                                 maxLines = 1,
                                 softWrap = false,
                                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Compact Voice Controls Strip (Conversa Contínua / Speaking indicator)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp)
+                    .padding(bottom = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Surface(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(50))
+                        .clickable {
+                            val next = !continuousVoiceEnabled
+                            onToggleContinuousVoice(next)
+                            if (next && !voiceRepliesEnabled) {
+                                onToggleVoiceReplies(true)
+                            }
+                        }
+                        .testTag("chat_continuous_voice_toggle"),
+                    shape = RoundedCornerShape(50),
+                    color = if (continuousVoiceEnabled) GothamSurfaceElevated else GothamSurface,
+                    border = BorderStroke(1.dp, if (continuousVoiceEnabled) GothamPureWhite else GothamHairline),
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(5.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.RecordVoiceOver,
+                            contentDescription = null,
+                            tint = if (continuousVoiceEnabled) GothamPureWhite else GothamSilver,
+                            modifier = Modifier.size(14.dp),
+                        )
+                        Text(
+                            text = if (continuousVoiceEnabled) "Conversa contínua ON" else "Conversa contínua",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (continuousVoiceEnabled) GothamPureWhite else GothamSilver,
+                        )
+                    }
+                }
+
+                AnimatedVisibility(visible = isSpeaking || isListening) {
+                    Surface(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .clickable {
+                                if (isSpeaking) voiceController.stopSpeaking()
+                                if (isListening) {
+                                    runCatching { speechRecognizer?.stopListening() }
+                                    isListening = false
+                                }
+                            }
+                            .testTag("chat_voice_active_pill"),
+                        shape = RoundedCornerShape(50),
+                        color = GothamPureWhite,
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                        ) {
+                            Icon(
+                                imageVector = if (isListening) Icons.Rounded.GraphicEq else Icons.Rounded.Stop,
+                                contentDescription = "Parar voz",
+                                tint = GothamVoid,
+                                modifier = Modifier.size(14.dp),
+                            )
+                            Text(
+                                text = if (isListening) "Ouvindo... tocar para parar" else "Alfred falando... parar",
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                color = GothamVoid,
                             )
                         }
                     }
@@ -681,22 +891,7 @@ fun AlfredChatScreen(
                     )
 
                     IconButton(
-                        onClick = {
-                            if (isListening) {
-                                speechRecognizer?.stopListening()
-                                isListening = false
-                            } else {
-                                val granted = ContextCompat.checkSelfPermission(
-                                    context,
-                                    Manifest.permission.RECORD_AUDIO
-                                ) == PackageManager.PERMISSION_GRANTED
-                                if (granted) {
-                                    startVoiceCapture()
-                                } else {
-                                    audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                                }
-                            }
-                        },
+                        onClick = triggerMicAction,
                         modifier = Modifier
                             .minimumInteractiveComponentSize()
                             .scale(micScale)
@@ -722,6 +917,8 @@ fun AlfredChatScreen(
                                 val bmp = attachedBitmap
                                 inputText = ""
                                 attachedBitmap = null
+                                lastSentByVoice = false
+                                pendingReplyVoiceTrigger = voiceRepliesEnabled
                                 onSendMessage(toSend, bmp)
                             }
                             .testTag("alfred_send_button"),

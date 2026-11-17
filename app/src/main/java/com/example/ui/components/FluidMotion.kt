@@ -23,6 +23,10 @@ import androidx.compose.ui.unit.dp
 import com.example.ui.theme.GothamHairline
 import com.example.ui.theme.GothamSurface
 import java.text.NumberFormat
+import java.time.LocalDate
+import java.time.Month
+import java.time.YearMonth
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 
 object AppleSprings {
@@ -126,16 +130,62 @@ data class MonthOption(
 )
 
 object MonthHelper {
-    val availableMonths = listOf(
-        MonthOption("2026-09", "Set", "Setembro 2026"),
-        MonthOption("2026-10", "Out", "Outubro 2026"),
-        MonthOption("2026-11", "Nov", "Novembro 2026"),
-        MonthOption("2026-12", "Dez", "Dezembro 2026"),
-        MonthOption("2027-01", "Jan", "Janeiro 2027"),
-    )
+    private val keyFormatter = DateTimeFormatter.ofPattern("yyyy-MM", Locale.US)
 
-    const val DEFAULT_MONTH_KEY = "2026-11"
+    val availableMonths: List<MonthOption>
+        get() = availableMonthsFor(YearMonth.now())
 
-    fun labelFor(monthKey: String): String =
-        availableMonths.firstOrNull { it.key == monthKey }?.fullLabel ?: monthKey
+    fun currentMonthKey(date: LocalDate = LocalDate.now()): String =
+        YearMonth.from(date).format(keyFormatter)
+
+    fun availableMonthsFor(center: YearMonth): List<MonthOption> {
+        return (-12L..12L).map { offset ->
+            val ym = center.plusMonths(offset)
+            MonthOption(
+                key = ym.format(keyFormatter),
+                shortLabel = shortLabelPt(ym.month),
+                fullLabel = "${fullLabelPt(ym.month)} ${ym.year}",
+            )
+        }
+    }
+
+    fun labelFor(monthKey: String): String {
+        availableMonths.firstOrNull { it.key == monthKey }?.let { return it.fullLabel }
+        val parsed = runCatching { YearMonth.parse(monthKey.trim(), keyFormatter) }.getOrNull()
+        return if (parsed != null) {
+            "${fullLabelPt(parsed.month)} ${parsed.year}"
+        } else {
+            monthKey
+        }
+    }
+
+    private fun shortLabelPt(month: Month): String = when (month) {
+        Month.JANUARY -> "Jan"
+        Month.FEBRUARY -> "Fev"
+        Month.MARCH -> "Mar"
+        Month.APRIL -> "Abr"
+        Month.MAY -> "Mai"
+        Month.JUNE -> "Jun"
+        Month.JULY -> "Jul"
+        Month.AUGUST -> "Ago"
+        Month.SEPTEMBER -> "Set"
+        Month.OCTOBER -> "Out"
+        Month.NOVEMBER -> "Nov"
+        Month.DECEMBER -> "Dez"
+    }
+
+    private fun fullLabelPt(month: Month): String = when (month) {
+        Month.JANUARY -> "Janeiro"
+        Month.FEBRUARY -> "Fevereiro"
+        Month.MARCH -> "Março"
+        Month.APRIL -> "Abril"
+        Month.MAY -> "Maio"
+        Month.JUNE -> "Junho"
+        Month.JULY -> "Julho"
+        Month.AUGUST -> "Agosto"
+        Month.SEPTEMBER -> "Setembro"
+        Month.OCTOBER -> "Outubro"
+        Month.NOVEMBER -> "Novembro"
+        Month.DECEMBER -> "Dezembro"
+    }
 }

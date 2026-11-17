@@ -41,6 +41,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.time.Instant
+import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Date
@@ -104,7 +105,7 @@ class FinanceViewModel(
     private val notificationBridge: AlfredNotificationBridge? = null,
 ) : ViewModel() {
 
-    private val _selectedMonthKey = MutableStateFlow(MonthHelper.DEFAULT_MONTH_KEY)
+    private val _selectedMonthKey = MutableStateFlow(MonthHelper.currentMonthKey())
     val selectedMonthKey: StateFlow<String> = _selectedMonthKey.asStateFlow()
 
     private val _hideValues = MutableStateFlow(false)
@@ -396,7 +397,7 @@ class FinanceViewModel(
                         accountId = account?.id.orEmpty(),
                         accountName = account?.name ?: if (scope == FinanceScope.BUSINESS) "Caixa PJ" else "Carteira",
                         monthKey = _selectedMonthKey.value,
-                        dayOfMonth = 15,
+                        dayOfMonth = LocalDate.now().dayOfMonth,
                         isPaid = isPaid,
                         isRecurring = isRecurring,
                         notes = notes,
@@ -485,6 +486,7 @@ class FinanceViewModel(
         if (title.isBlank()) return
         viewModelScope.launch {
             try {
+                val anchorDay = dueAt?.toDate()?.toInstant()?.atZone(ZoneId.systemDefault())?.dayOfMonth ?: 0
                 repository.addReminder(
                     FinanceReminder(
                         scope = scope.wireValue,
@@ -494,6 +496,7 @@ class FinanceViewModel(
                         dueAt = dueAt,
                         recurrence = recurrence.wireValue,
                         monthKey = monthKey,
+                        anchorDay = anchorDay,
                         isCompleted = false,
                     )
                 )
@@ -517,6 +520,7 @@ class FinanceViewModel(
         if (reminderId.isBlank() || title.isBlank()) return
         viewModelScope.launch {
             try {
+                val anchorDay = dueAt?.toDate()?.toInstant()?.atZone(ZoneId.systemDefault())?.dayOfMonth ?: 0
                 repository.updateReminder(
                     reminderId = reminderId,
                     title = title.trim(),
@@ -525,6 +529,7 @@ class FinanceViewModel(
                     dueAt = dueAt,
                     recurrence = recurrence.wireValue,
                     monthKey = monthKey,
+                    anchorDay = anchorDay,
                 )
             } catch (e: CancellationException) {
                 throw e
@@ -540,10 +545,19 @@ class FinanceViewModel(
                 val markingComplete = !reminder.isCompleted
                 val recurrence = ReminderRecurrence.fromWire(reminder.recurrence)
                 if (markingComplete && recurrence != ReminderRecurrence.NONE) {
-                    val baseMillis = reminder.dueAt?.toDate()?.time ?: System.currentTimeMillis()
-                    val nextMillis = ReminderScheduleHelper.computeNextOccurrenceMillis(baseMillis, recurrence)
+                    val zone = ZoneId.systemDefault()
+                    val nowMillis = System.currentTimeMillis()
+                    val baseMillis = reminder.dueAt?.toDate()?.time ?: nowMillis
+                    val anchorDay = reminder.anchorDay.takeIf { it in 1..31 }
+                        ?: Instant.ofEpochMilli(baseMillis).atZone(zone).dayOfMonth
+                    val nextMillis = ReminderScheduleHelper.computeNextOccurrenceMillis(
+                        currentDueAtMillis = baseMillis,
+                        recurrence = recurrence,
+                        zoneId = zone,
+                        nowMillis = nowMillis,
+                        anchorDayOfMonth = anchorDay,
+                    )
                     if (nextMillis != null) {
-                        val zone = ZoneId.systemDefault()
                         val nextId = ReminderScheduleHelper.deterministicNextOccurrenceId(reminder.id, nextMillis, zone)
                         val nextDueAt = Timestamp(Date(nextMillis))
                         val nextDueDateText = ReminderScheduleHelper.formatDueDateText(nextMillis, zoneId = zone)
@@ -556,9 +570,17 @@ class FinanceViewModel(
                             nextDueAt = nextDueAt,
                             nextDueDateText = nextDueDateText,
                             nextMonthKey = nextMonthKey,
+                            nextAnchorDay = anchorDay,
                         )
                         return@launch
                     }
+                }
+                if (!markingComplete && recurrence != ReminderRecurrence.NONE && reminder.generatedNextId.isNotBlank()) {
+                    repository.reopenRecurringReminder(
+                        reminderId = reminder.id,
+                        generatedNextId = reminder.generatedNextId,
+                    )
+                    return@launch
                 }
                 repository.toggleReminderCompleted(reminder.id, markingComplete)
             } catch (e: CancellationException) {
@@ -771,6 +793,7 @@ class FinanceViewModel(
                                 if (localParsed.scope == FinanceScope.BUSINESS) "Caixa PJ" else "Carteira"
                             }
                         val presetTxId = nextId(retryState.txIds, txIdx++, "transactions")
+                        val txDate = localParsed.date
                         repository.addTransaction(
                             tx = FinanceTransaction(
                                 scope = localParsed.scope.wireValue,
@@ -780,8 +803,8 @@ class FinanceViewModel(
                                 amount = localParsed.amount,
                                 accountId = matchedAccount?.id.orEmpty(),
                                 accountName = resolvedAccountName,
-                                monthKey = _selectedMonthKey.value,
-                                dayOfMonth = 15,
+                                monthKey = MonthHelper.currentMonthKey(txDate),
+                                dayOfMonth = txDate.dayOfMonth,
                                 isPaid = localParsed.isPaid,
                                 isRecurring = false,
                             ),
@@ -905,7 +928,14 @@ class FinanceViewModel(
                                             action.accountName.isNotBlank() &&
                                             acc.name.equals(action.accountName, ignoreCase = true)
                                     }
-                                    val resolvedAccount = matchedAccount?.name ?: action.accountName
+                                    val resolvedAccount = matchedAccount?.name
+                                        ?: action.accountName.ifBlank {
+                                            if (action.scope == FinanceScope.BUSINESS) "Caixa PJ" else "Carteira"
+                                        }
+                                    val txDate = action.transactionDateIso.trim()
+                                        .takeIf { it.isNotBlank() }
+                                        ?.let { iso -> runCatching { LocalDate.parse(iso) }.getOrNull() }
+                                        ?: LocalDate.now()
                                     val presetId = nextId(retryState.txIds, txIdx++, "transactions")
                                     repository.addTransaction(
                                         tx = FinanceTransaction(
@@ -916,8 +946,8 @@ class FinanceViewModel(
                                             amount = action.amount,
                                             accountId = matchedAccount?.id.orEmpty(),
                                             accountName = resolvedAccount,
-                                            monthKey = _selectedMonthKey.value,
-                                            dayOfMonth = 15,
+                                            monthKey = MonthHelper.currentMonthKey(txDate),
+                                            dayOfMonth = txDate.dayOfMonth,
                                             isPaid = action.isPaid,
                                             isRecurring = false,
                                         ),
@@ -938,6 +968,9 @@ class FinanceViewModel(
                                         ?: action.dueDateText.ifBlank { "Em breve" }
                                     val rec = ReminderRecurrence.fromWire(action.recurrence)
                                     val monthKey = parsedDue?.monthKey ?: _selectedMonthKey.value
+                                    val anchorDay = parsedDue?.epochMillis
+                                        ?.let { Instant.ofEpochMilli(it).atZone(ZoneId.systemDefault()).dayOfMonth }
+                                        ?: 0
                                     val presetId = nextId(retryState.reminderIds, remIdx++, "reminders")
                                     repository.addReminder(
                                         reminder = FinanceReminder(
@@ -948,6 +981,7 @@ class FinanceViewModel(
                                             dueAt = parsedDue?.timestamp,
                                             recurrence = rec.wireValue,
                                             monthKey = monthKey,
+                                            anchorDay = anchorDay,
                                             isCompleted = false,
                                         ),
                                         presetId = presetId,

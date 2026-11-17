@@ -255,4 +255,13 @@ class AlfredNotificationFormatterTest {
         val sundayAfter9 = ZonedDateTime.of(2026, 5, 24, 10, 0, 0, 0, zone) // Sunday 10:00
         assertEquals((7L * 24L - 1L) * 3_600_000L, SummaryWorkScheduler.millisUntilNextWeeklySunday(hour = 9, minute = 0, now = sundayAfter9))
     }
+
+    @Test
+    fun summaryWorkScheduler_changingDailyHourUpdatesNextTrigger() {
+        val now = ZonedDateTime.of(2026, 5, 18, 9, 0, 0, 0, zone)
+        val at14 = SummaryWorkScheduler.nextDailyTriggerAtMillis(hour = 14, minute = 30, now = now)
+        val at20 = SummaryWorkScheduler.nextDailyTriggerAtMillis(hour = 20, minute = 0, now = now)
+        assertNotEquals(at14, at20)
+        assertEquals(5L * 3_600_000L + 30L * 60_000L, at20 - at14)
+    }
 }

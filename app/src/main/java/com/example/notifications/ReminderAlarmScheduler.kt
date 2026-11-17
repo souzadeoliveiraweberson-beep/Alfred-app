@@ -26,7 +26,7 @@ class ReminderAlarmScheduler(
 
         val activeSnapshots = reminders.mapNotNull { rem ->
             val dueMs = rem.dueAt?.toDate()?.time ?: return@mapNotNull null
-            if (rem.isCompleted || dueMs <= nowMillis - GRACE_WINDOW_MS) return@mapNotNull null
+            if (rem.isCompleted || dueMs <= nowMillis + MIN_FUTURE_LEAD_MS) return@mapNotNull null
             ReminderAlarmSnapshot(
                 id = rem.id,
                 title = rem.title,
@@ -56,7 +56,7 @@ class ReminderAlarmScheduler(
     suspend fun rescheduleFromCache(nowMillis: Long = System.currentTimeMillis()) {
         val settings = preferences.getSettings()
         val snapshots = preferences.getCachedReminderSnapshots()
-            .filter { it.dueAtMillis > nowMillis - GRACE_WINDOW_MS }
+            .filter { it.dueAtMillis > nowMillis + MIN_FUTURE_LEAD_MS }
 
         preferences.saveCachedReminderSnapshots(snapshots)
         if (!settings.remindersEnabled) {
@@ -73,15 +73,18 @@ class ReminderAlarmScheduler(
         oneHourBeforeEnabled: Boolean,
         nowMillis: Long,
     ) {
-        val triggerOnTime = snapshot.dueAtMillis.coerceAtLeast(nowMillis + 1_000L)
+        if (snapshot.dueAtMillis <= nowMillis + MIN_FUTURE_LEAD_MS) {
+            cancelSnapshotAlarms(snapshot.id)
+            return
+        }
         scheduleAlarm(
             snapshot = snapshot,
-            triggerAtMillis = triggerOnTime,
+            triggerAtMillis = snapshot.dueAtMillis,
             isOneHourEarly = false,
         )
 
         val oneHourBeforeMillis = snapshot.dueAtMillis - ONE_HOUR_MS
-        if (oneHourBeforeEnabled && oneHourBeforeMillis > nowMillis + 5_000L) {
+        if (oneHourBeforeEnabled && oneHourBeforeMillis > nowMillis + MIN_FUTURE_LEAD_MS) {
             scheduleAlarm(
                 snapshot = snapshot,
                 triggerAtMillis = oneHourBeforeMillis,
@@ -194,7 +197,7 @@ class ReminderAlarmScheduler(
 
     private companion object {
         const val ONE_HOUR_MS = 3_600_000L
-        const val GRACE_WINDOW_MS = 60_000L
+        const val MIN_FUTURE_LEAD_MS = 1_000L
         const val TEST_NOTIFICATION_ID = 90_901
     }
 }

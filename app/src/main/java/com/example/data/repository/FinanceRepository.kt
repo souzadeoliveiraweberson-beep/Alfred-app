@@ -286,6 +286,12 @@ class FinanceRepository(
             put("monthKey", reminder.monthKey)
             put("isCompleted", reminder.isCompleted)
             put("recurrence", ReminderRecurrence.fromWire(reminder.recurrence).wireValue)
+            if (reminder.anchorDay in 1..31) {
+                put("anchorDay", reminder.anchorDay)
+            }
+            if (reminder.generatedNextId.isNotBlank()) {
+                put("generatedNextId", reminder.generatedNextId.take(128))
+            }
             if (reminder.dueAt != null) {
                 put("dueAt", reminder.dueAt)
             }
@@ -306,6 +312,7 @@ class FinanceRepository(
         dueAt: Timestamp?,
         recurrence: String,
         monthKey: String,
+        anchorDay: Int = 0,
     ) {
         val uid = requireUserId()
         val docRef = userRoot(uid).collection("reminders").document(reminderId)
@@ -318,6 +325,9 @@ class FinanceRepository(
             "dueAt" to dueAt,
             "updatedAt" to FieldValue.serverTimestamp(),
         )
+        if (anchorDay in 1..31) {
+            updates["anchorDay"] = anchorDay
+        }
         executeWrite(OperationType.UPDATE, docRef.path) {
             docRef.update(updates).await()
         }
@@ -342,33 +352,66 @@ class FinanceRepository(
         nextDueAt: Timestamp,
         nextDueDateText: String,
         nextMonthKey: String,
+        nextAnchorDay: Int = 0,
     ) {
         val uid = requireUserId()
         val currentRef = userRoot(uid).collection("reminders").document(reminder.id)
         val nextRef = userRoot(uid).collection("reminders").document(nextOccurrenceId)
-        val nextPayload = mapOf(
-            "userId" to uid,
-            "scope" to reminder.scope,
-            "title" to reminder.title.trim().take(120),
-            "amount" to reminder.amount.coerceAtLeast(0.0),
-            "dueDateText" to nextDueDateText.trim().ifBlank { "Em breve" }.take(40),
-            "dueAt" to nextDueAt,
-            "recurrence" to ReminderRecurrence.fromWire(reminder.recurrence).wireValue,
-            "monthKey" to nextMonthKey,
-            "isCompleted" to false,
-            "createdAt" to FieldValue.serverTimestamp(),
-            "updatedAt" to FieldValue.serverTimestamp(),
-        )
+        val nextPayload = buildMap<String, Any> {
+            put("userId", uid)
+            put("scope", reminder.scope)
+            put("title", reminder.title.trim().take(120))
+            put("amount", reminder.amount.coerceAtLeast(0.0))
+            put("dueDateText", nextDueDateText.trim().ifBlank { "Em breve" }.take(40))
+            put("dueAt", nextDueAt)
+            put("recurrence", ReminderRecurrence.fromWire(reminder.recurrence).wireValue)
+            put("monthKey", nextMonthKey)
+            if (nextAnchorDay in 1..31) {
+                put("anchorDay", nextAnchorDay)
+            }
+            put("isCompleted", false)
+            put("createdAt", FieldValue.serverTimestamp())
+            put("updatedAt", FieldValue.serverTimestamp())
+        }
         executeWrite(OperationType.UPDATE, currentRef.path) {
             db.runBatch { batch ->
                 batch.update(
                     currentRef,
                     mapOf(
                         "isCompleted" to true,
+                        "generatedNextId" to nextOccurrenceId.take(128),
                         "updatedAt" to FieldValue.serverTimestamp(),
                     )
                 )
                 batch.set(nextRef, nextPayload)
+            }.await()
+        }
+    }
+
+    suspend fun reopenRecurringReminder(
+        reminderId: String,
+        generatedNextId: String,
+    ) {
+        val uid = requireUserId()
+        val currentRef = userRoot(uid).collection("reminders").document(reminderId)
+        val nextId = generatedNextId.trim()
+        executeWrite(OperationType.UPDATE, currentRef.path) {
+            db.runTransaction { tx ->
+                val nextRef = nextId.takeIf { it.isNotBlank() }
+                    ?.let { userRoot(uid).collection("reminders").document(it) }
+                val nextSnap = nextRef?.let { tx.get(it) }
+
+                tx.update(
+                    currentRef,
+                    mapOf(
+                        "isCompleted" to false,
+                        "generatedNextId" to "",
+                        "updatedAt" to FieldValue.serverTimestamp(),
+                    )
+                )
+                if (nextRef != null && nextSnap != null && nextSnap.exists() && nextSnap.getBoolean("isCompleted") != true) {
+                    tx.delete(nextRef)
+                }
             }.await()
         }
     }

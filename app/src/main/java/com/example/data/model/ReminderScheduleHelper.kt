@@ -6,6 +6,7 @@ import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.LocalTime
 import java.time.OffsetDateTime
+import java.time.YearMonth
 import java.time.ZoneId
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
@@ -97,16 +98,36 @@ object ReminderScheduleHelper {
         currentDueAtMillis: Long,
         recurrence: ReminderRecurrence,
         zoneId: ZoneId = ZoneId.systemDefault(),
+        nowMillis: Long = currentDueAtMillis,
+        anchorDayOfMonth: Int? = null,
     ): Long? {
         if (recurrence == ReminderRecurrence.NONE) return null
         val current = Instant.ofEpochMilli(currentDueAtMillis).atZone(zoneId)
-        val next = when (recurrence) {
-            ReminderRecurrence.DAILY -> current.plusDays(1)
-            ReminderRecurrence.WEEKLY -> current.plusWeeks(1)
-            ReminderRecurrence.MONTHLY -> current.plusMonths(1)
-            ReminderRecurrence.NONE -> return null
+        val anchorDay = (anchorDayOfMonth?.takeIf { it in 1..31 } ?: current.dayOfMonth)
+        val targetMinMillis = maxOf(currentDueAtMillis, nowMillis)
+
+        var cycle = 1L
+        while (cycle <= 2000L) {
+            val candidate = when (recurrence) {
+                ReminderRecurrence.DAILY -> current.plusDays(cycle)
+                ReminderRecurrence.WEEKLY -> current.plusWeeks(cycle)
+                ReminderRecurrence.MONTHLY -> {
+                    val ym = YearMonth.from(current).plusMonths(cycle)
+                    val clampedDay = anchorDay.coerceAtMost(ym.lengthOfMonth())
+                    current
+                        .withYear(ym.year)
+                        .withMonth(ym.monthValue)
+                        .withDayOfMonth(clampedDay)
+                }
+                ReminderRecurrence.NONE -> return null
+            }
+            val candidateMillis = candidate.toInstant().toEpochMilli()
+            if (candidateMillis > targetMinMillis) {
+                return candidateMillis
+            }
+            cycle++
         }
-        return next.toInstant().toEpochMilli()
+        return null
     }
 
     fun deterministicNextOccurrenceId(

@@ -1,3 +1,12 @@
 <resources>
     <string name="app_name">Alfred</string>
+    <string name="shortcut_talk_alfred_short">Falar com Alfred</string>
+    <string name="shortcut_talk_alfred_long">Abrir chat por voz com Alfred</string>
+    <string name="shortcut_quick_add_short">Novo lançamento</string>
+    <string name="shortcut_quick_add_long">Registrar gasto ou receita rápida</string>
+    <string name="shortcut_business_short">Caixa Empresa</string>
+    <string name="shortcut_business_long">Abrir painel financeiro da empresa</string>
+    <string name="tile_alfred_voice_label">Falar com Alfred</string>
+    <string name="tile_alfred_voice_subtitle">Finanças &amp; Empresa</string>
+    <string name="tile_alfred_voice_description">Abre o Alfred pronto para ouvir seu comando de voz</string>
 </resources>

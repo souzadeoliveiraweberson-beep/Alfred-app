@@ -13,13 +13,15 @@ import com.example.data.remote.AlfredAiService
 import com.example.data.remote.configureAppCheck
 import com.example.notifications.NotificationChannels
 import com.example.ui.navigation.AlfredApp
+import com.example.ui.navigation.AlfredDeepLinkParser
+import com.example.ui.navigation.AlfredLaunchAction
 import com.example.ui.theme.AlfredTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
-    private var pendingNavRoute by mutableStateOf<String?>(null)
+    private var pendingLaunchAction by mutableStateOf<AlfredLaunchAction?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -27,7 +29,7 @@ class MainActivity : ComponentActivity() {
         // Mandatory App Check initialization before Compose UI, ViewModels, or Firebase AI calls
         configureAppCheck(this, intent)
         NotificationChannels.ensureCreated(this)
-        pendingNavRoute = extractNavRoute(intent)
+        pendingLaunchAction = AlfredDeepLinkParser.parse(intent)
 
         if (BuildConfig.DEBUG) {
             lifecycleScope.launch(Dispatchers.IO) {
@@ -39,8 +41,8 @@ class MainActivity : ComponentActivity() {
         setContent {
             AlfredTheme {
                 AlfredApp(
-                    pendingNavRoute = pendingNavRoute,
-                    onConsumeNavRoute = { pendingNavRoute = null },
+                    pendingLaunchAction = pendingLaunchAction,
+                    onConsumeLaunchAction = { pendingLaunchAction = null },
                 )
             }
         }
@@ -49,13 +51,8 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        extractNavRoute(intent)?.let { route ->
-            pendingNavRoute = route
+        AlfredDeepLinkParser.parse(intent)?.let { action ->
+            pendingLaunchAction = action
         }
-    }
-
-    private fun extractNavRoute(intent: Intent?): String? {
-        return intent?.getStringExtra(NotificationChannels.EXTRA_NAV_ROUTE)
-            ?.takeIf { it.isNotBlank() }
     }
 }

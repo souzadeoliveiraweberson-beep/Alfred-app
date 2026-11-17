@@ -61,6 +61,8 @@
         "dueAt": { "type": "string", "format": "date-time", "description": "Optional exact reminder timestamp" },
         "recurrence": { "type": "string", "enum": ["NONE", "DAILY", "WEEKLY", "MONTHLY"] },
         "monthKey": { "type": "string" },
+        "anchorDay": { "type": "integer", "description": "Original day of month for monthly recurrence (1-31)" },
+        "generatedNextId": { "type": "string", "description": "ID of auto-generated next recurring occurrence" },
         "isCompleted": { "type": "boolean" },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }

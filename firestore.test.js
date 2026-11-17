@@ -258,6 +258,7 @@ test("Reminders, goals, and chat messages enforce ownership and schema", async (
         dueAt: new Date(now.getTime() + 86400000),
         recurrence: "MONTHLY",
         monthKey: "2026-11",
+        anchorDay: 31,
         isCompleted: false,
         createdAt: now,
         updatedAt: now,
@@ -274,6 +275,8 @@ test("Reminders, goals, and chat messages enforce ownership and schema", async (
         dueDateText: "20 Nov, 14:00",
         dueAt: new Date(now.getTime() + 2 * 86400000),
         recurrence: "WEEKLY",
+        generatedNextId: "rem_with_due_at_next_202612310900",
+        isCompleted: true,
         updatedAt: new Date(),
       })
   );

@@ -157,4 +157,36 @@ class LocalCommandParserTest {
         assertEquals(1, singleClause.size)
         assertEquals("paguei 120 de luz e água", singleClause[0])
     }
+
+    @Test
+    fun parseTransaction_extractsRelativeAndExplicitDatesWithoutConfusingAmount() {
+        val ref = java.time.LocalDate.of(2026, 11, 16)
+
+        val ontem = LocalCommandParser.parseTransaction(
+            rawInput = "gastei 35 no lanche ontem",
+            activeScope = FinanceScope.PERSONAL,
+            referenceDate = ref,
+        )!!
+        assertEquals(35.0, ontem.amount, 0.001)
+        assertEquals("Lanche", ontem.title)
+        assertEquals(java.time.LocalDate.of(2026, 11, 15), ontem.date)
+
+        val dia10 = LocalCommandParser.parseTransaction(
+            rawInput = "dia 10 gastei 50 no mercado",
+            activeScope = FinanceScope.PERSONAL,
+            referenceDate = ref,
+        )!!
+        assertEquals(50.0, dia10.amount, 0.001)
+        assertEquals("Mercado", dia10.title)
+        assertEquals(java.time.LocalDate.of(2026, 11, 10), dia10.date)
+
+        val slashDate = LocalCommandParser.parseTransaction(
+            rawInput = "paguei 80 no uber em 10/10",
+            activeScope = FinanceScope.PERSONAL,
+            referenceDate = ref,
+        )!!
+        assertEquals(80.0, slashDate.amount, 0.001)
+        assertEquals("Uber", slashDate.title)
+        assertEquals(java.time.LocalDate.of(2026, 10, 10), slashDate.date)
+    }
 }

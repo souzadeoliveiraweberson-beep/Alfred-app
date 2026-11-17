@@ -42,6 +42,7 @@ data class AlfredParsedAction(
     val dueAtIso: String,
     val recurrence: String,
     val actionSummary: String,
+    val transactionDateIso: String = "",
 )
 
 data class AlfredMultiActionResponse(
@@ -98,8 +99,11 @@ class AlfredAiService {
             "actionSummary" to Schema.string(
                 description = "Resumo curto opcional da ação"
             ),
+            "transactionDateIso" to Schema.string(
+                description = "Data do lançamento em YYYY-MM-DD (resolva expressões como 'ontem', 'dia 10', '10/10' usando a data atual do dispositivo)."
+            ),
         ),
-        optionalProperties = listOf("dueDateText", "dueAtIso", "recurrence", "actionSummary")
+        optionalProperties = listOf("dueDateText", "dueAtIso", "recurrence", "actionSummary", "transactionDateIso")
     )
 
     private val commandSchema = Schema.obj(
@@ -144,7 +148,7 @@ class AlfredAiService {
             - Use scope = "BUSINESS" quando o usuário mencionar empresa, negócio, cliente, venda, serviço prestado, fornecedor, nota fiscal PJ, imposto, faturamento ou caixa da empresa.
             - Use scope = "PERSONAL" quando for gasto pessoal, casa, mercado, almoço, academia, salário ou lazer — ou mantenha o escopo ativo sugerido se for ambíguo.
             Intenções:
-            - CREATE_TRANSACTION: gasto/receita com valor > 0 claro (ou comprovante/imagem).
+            - CREATE_TRANSACTION: gasto/receita com valor > 0 claro (ou comprovante/imagem). Se o usuário citar data (ex: "ontem", "dia 10", "10/10"), preencha "transactionDateIso" no formato YYYY-MM-DD usando a data atual informada; senão use a data atual.
             - CREATE_REMINDER: lembrete com data/hora calculada usando a data/hora atual e fuso horário informados no prompt. Preencha "dueAtIso" em ISO-8601 com offset (ex: 2026-11-17T14:00:00-03:00). Se o usuário não informar o horário, defina 09:00 e mencione em "replyText" que marcou para as 09:00. Preencha "recurrence" (NONE, DAILY, WEEKLY, MONTHLY).
             - CREATE_GOAL: criar nova meta de economia/reserva.
             - CONTRIBUTE_GOAL: aportar/guardar valor em meta existente (ex: "guardei 200 na meta do iPhone" -> title = "iPhone", amount = 200.0).
@@ -477,6 +481,7 @@ class AlfredAiService {
                                 dueAtIso = obj.optString("dueAtIso", ""),
                                 recurrence = obj.optString("recurrence", "NONE").ifBlank { "NONE" },
                                 actionSummary = obj.optString("actionSummary", ""),
+                                transactionDateIso = obj.optString("transactionDateIso", ""),
                             )
                         )
                     }

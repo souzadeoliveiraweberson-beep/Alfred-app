@@ -4,6 +4,9 @@ import com.example.data.model.FinanceAccount
 import com.example.data.model.FinanceScope
 import com.example.data.model.TransactionType
 import java.text.Normalizer
+import java.time.LocalDate
+import java.time.Month
+import java.time.YearMonth
 import java.util.Locale
 
 data class LocalParsedTransaction(
@@ -14,6 +17,7 @@ data class LocalParsedTransaction(
     val amount: Double,
     val isPaid: Boolean,
     val accountName: String = "",
+    val date: LocalDate = LocalDate.now(),
 ) {
     fun toAlfredConfirmation(): String {
         val formattedValue = String.format(Locale.forLanguageTag("pt-BR"), "R$ %.2f", amount)
@@ -155,6 +159,7 @@ object LocalCommandParser {
         rawInput: String,
         activeScope: FinanceScope,
         knownAccounts: List<FinanceAccount> = emptyList(),
+        referenceDate: LocalDate = LocalDate.now(),
     ): CompoundSplitResult {
         val segments = splitCompoundSegments(rawInput)
         if (segments.isEmpty()) {
@@ -166,7 +171,7 @@ object LocalCommandParser {
         val unresolved = mutableListOf<String>()
 
         for (seg in segments) {
-            val tx = parseTransaction(seg, activeScope, knownAccounts)
+            val tx = parseTransaction(seg, activeScope, knownAccounts, referenceDate)
             if (tx != null && tx.amount > 0.0 && tx.title.isNotBlank()) {
                 resolvedTx.add(tx)
                 continue
@@ -231,6 +236,7 @@ object LocalCommandParser {
         rawInput: String,
         activeScope: FinanceScope,
         knownAccounts: List<FinanceAccount> = emptyList(),
+        referenceDate: LocalDate = LocalDate.now(),
     ): LocalParsedTransaction? {
         val trimmed = rawInput.trim()
         if (trimmed.isBlank()) return null
@@ -265,6 +271,7 @@ object LocalCommandParser {
             scope = scope,
         )
         val isPaid = detectIsPaid(normalized, words)
+        val parsedDate = extractTransactionDate(normalized, referenceDate)
 
         return LocalParsedTransaction(
             scope = scope,
@@ -274,6 +281,7 @@ object LocalCommandParser {
             amount = amount,
             isPaid = isPaid,
             accountName = extracted.accountName,
+            date = parsedDate,
         )
     }
 
@@ -307,9 +315,93 @@ object LocalCommandParser {
     }
 
     internal fun extractAmount(rawInput: String): Double? {
-        val match = AMOUNT_REGEX.find(rawInput) ?: return null
+        val sanitized = stripDateTokensForAmountScan(rawInput)
+        val match = AMOUNT_REGEX.find(sanitized) ?: return null
         val token = match.groupValues.getOrNull(1)?.trim() ?: return null
         return parseBrazilianNumber(token)
+    }
+
+    private fun stripDateTokensForAmountScan(rawInput: String): String {
+        return rawInput
+            .replace(Regex("""\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b"""), " ")
+            .replace(Regex("""(?i)\bdia\s+\d{1,2}(?:\s+de\s+[a-zçãõáéíóú]+)?\b"""), " ")
+            .replace(Regex("""(?i)\b(?:no\s+)?\d{1,2}\s+de\s+(?:janeiro|fevereiro|março|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\b"""), " ")
+    }
+
+    internal fun extractTransactionDate(
+        normalized: String,
+        referenceDate: LocalDate = LocalDate.now(),
+    ): LocalDate {
+        if (containsWordOrPhrase(normalized, "anteontem")) {
+            return referenceDate.minusDays(2)
+        }
+        if (containsWordOrPhrase(normalized, "ontem")) {
+            return referenceDate.minusDays(1)
+        }
+        if (containsWordOrPhrase(normalized, "hoje")) {
+            return referenceDate
+        }
+
+        // dd/MM/yyyy or dd/MM
+        val slashMatch = Regex("""\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b""").find(normalized)
+        if (slashMatch != null) {
+            val day = slashMatch.groupValues[1].toIntOrNull()
+            val month = slashMatch.groupValues[2].toIntOrNull()
+            val yearRaw = slashMatch.groupValues[3].toIntOrNull()
+            if (day != null && month != null && month in 1..12) {
+                val year = when {
+                    yearRaw == null -> referenceDate.year
+                    yearRaw < 100 -> 2000 + yearRaw
+                    else -> yearRaw
+                }
+                val ym = YearMonth.of(year, month)
+                if (day in 1..ym.lengthOfMonth()) {
+                    return LocalDate.of(year, month, day)
+                }
+            }
+        }
+
+        // "dia N de mês" or "N de mês" or "dia N"
+        val dayWithMonthMatch = Regex(
+            """\b(?:dia\s+)?(\d{1,2})\s+de\s+(janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\b"""
+        ).find(normalized)
+        if (dayWithMonthMatch != null) {
+            val day = dayWithMonthMatch.groupValues[1].toIntOrNull()
+            val month = parsePortugueseMonth(dayWithMonthMatch.groupValues[2])
+            if (day != null && month != null) {
+                val ym = YearMonth.of(referenceDate.year, month)
+                if (day in 1..ym.lengthOfMonth()) {
+                    return LocalDate.of(referenceDate.year, month, day)
+                }
+            }
+        }
+
+        val diaOnlyMatch = Regex("""\bdia\s+(\d{1,2})\b""").find(normalized)
+        if (diaOnlyMatch != null) {
+            val day = diaOnlyMatch.groupValues[1].toIntOrNull()
+            if (day != null && day in 1..31) {
+                val ym = YearMonth.from(referenceDate)
+                return LocalDate.of(ym.year, ym.month, day.coerceAtMost(ym.lengthOfMonth()))
+            }
+        }
+
+        return referenceDate
+    }
+
+    private fun parsePortugueseMonth(monthNorm: String): Month? = when (monthNorm) {
+        "janeiro" -> Month.JANUARY
+        "fevereiro" -> Month.FEBRUARY
+        "marco" -> Month.MARCH
+        "abril" -> Month.APRIL
+        "maio" -> Month.MAY
+        "junho" -> Month.JUNE
+        "julho" -> Month.JULY
+        "agosto" -> Month.AUGUST
+        "setembro" -> Month.SEPTEMBER
+        "outubro" -> Month.OCTOBER
+        "novembro" -> Month.NOVEMBER
+        "dezembro" -> Month.DECEMBER
+        else -> null
     }
 
     private fun parseBrazilianNumber(token: String): Double? {
@@ -370,7 +462,10 @@ object LocalCommandParser {
             val end = if (i + 1 < matches.size) matches[i + 1].range.first else trimmed.length
             if (start <= end) {
                 val seg = trimmed.substring(start, end)
-                    .replace(Regex("""(?i)\b(?:hoje|ontem|agora|aqui)\b"""), "")
+                    .replace(Regex("""\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b"""), " ")
+                    .replace(Regex("""(?i)\bdia\s+\d{1,2}\b"""), " ")
+                    .replace(Regex("""(?i)\b(?:hoje|ontem|anteontem|agora|aqui)\b"""), "")
+                    .replace(Regex("""\s+"""), " ")
                     .trim(' ', '.', ',', '!', '?')
                 if (seg.isNotBlank()) segments.add(seg)
             }
@@ -421,15 +516,15 @@ object LocalCommandParser {
         }
 
         if (candidate.isBlank()) {
-            // Fallback: strip verb + amount from original text
-            var stripped = rawInput
+            // Fallback: strip verb + date + amount from original text
+            var stripped = stripDateTokensForAmountScan(rawInput)
             stripped = AMOUNT_REGEX.replace(stripped, " ")
             stripped = stripped.replace(
                 Regex("""(?i)\b(?:gastei|paguei|comprei|recebi|vendi|faturei|ganhei|transferi|registra|lanca|lança|anota)\b"""),
                 " "
             )
             stripped = stripped.replace(
-                Regex("""(?i)\b(?:no|na|nos|nas|do|da|dos|das|de|em|com|um|uma|o|a|reais|real|hoje|ontem)\b"""),
+                Regex("""(?i)\b(?:no|na|nos|nas|do|da|dos|das|de|em|com|um|uma|o|a|reais|real|hoje|ontem|anteontem)\b"""),
                 " "
             ).replace(Regex("""\s+"""), " ").trim(' ', '.', ',', '!', '?')
 

@@ -29,6 +29,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -71,6 +72,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -298,15 +300,26 @@ fun DashboardScreen(
                 }
             }
 
-            // 2. Month Selector Strip
+            // 2. Month Selector Strip (dynamic -12..+12 months around current month)
             item {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState()),
+                val monthOptions = remember { MonthHelper.availableMonths }
+                val currentYearPrefix = remember { "${LocalDate.now().year}-" }
+                val initialIndex = remember(monthOptions) {
+                    monthOptions.indexOfFirst { it.key == selectedMonthKey }.coerceAtLeast(0)
+                }
+                val monthRowState = rememberLazyListState(initialFirstVisibleItemIndex = initialIndex)
+                LaunchedEffect(selectedMonthKey, monthOptions) {
+                    val targetIdx = monthOptions.indexOfFirst { it.key == selectedMonthKey }
+                    if (targetIdx >= 0) {
+                        monthRowState.animateScrollToItem(targetIdx)
+                    }
+                }
+                LazyRow(
+                    state = monthRowState,
+                    modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    MonthHelper.availableMonths.forEach { month ->
+                    items(monthOptions, key = { it.key }) { month ->
                         val selected = month.key == selectedMonthKey
                         val bg by animateColorAsState(
                             targetValue = if (selected) GothamPureWhite else GothamSurface,
@@ -316,6 +329,11 @@ fun DashboardScreen(
                             targetValue = if (selected) GothamVoid else GothamSilver,
                             label = "month_fg",
                         )
+                        val chipText = if (month.key.startsWith(currentYearPrefix)) {
+                            month.shortLabel
+                        } else {
+                            "${month.shortLabel}/${month.key.substring(2, 4)}"
+                        }
                         Surface(
                             modifier = Modifier
                                 .height(42.dp)
@@ -331,7 +349,7 @@ fun DashboardScreen(
                                 contentAlignment = Alignment.Center,
                             ) {
                                 Text(
-                                    text = month.shortLabel,
+                                    text = chipText,
                                     style = MaterialTheme.typography.labelLarge,
                                     color = fg,
                                 )

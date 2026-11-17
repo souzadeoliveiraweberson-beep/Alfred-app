@@ -62,6 +62,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -80,7 +81,10 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
@@ -97,6 +101,7 @@ import com.example.notifications.NotificationPreferences
 import com.example.notifications.NotificationSettings
 import com.example.notifications.ReminderAlarmScheduler
 import com.example.notifications.SummaryWorkScheduler
+import com.example.quicksettings.AlfredVoiceTileService
 import com.example.ui.components.CalculatorEntrySheet
 import com.example.ui.components.NotificationSettingsSheet
 import com.example.ui.screens.AlfredChatScreen
@@ -179,8 +184,8 @@ internal fun FirebaseAuth.authStateFlow(): Flow<FirebaseUser?> = callbackFlow {
 @Composable
 fun AlfredApp(
     auth: FirebaseAuth = Firebase.auth,
-    pendingNavRoute: String? = null,
-    onConsumeNavRoute: () -> Unit = {},
+    pendingLaunchAction: AlfredLaunchAction? = null,
+    onConsumeLaunchAction: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val currentUser by auth.authStateFlow()
@@ -199,8 +204,8 @@ fun AlfredApp(
         key(user.uid) {
             AuthenticatedAlfredShell(
                 currentUser = user,
-                pendingNavRoute = pendingNavRoute,
-                onConsumeNavRoute = onConsumeNavRoute,
+                pendingLaunchAction = pendingLaunchAction,
+                onConsumeLaunchAction = onConsumeLaunchAction,
             )
         }
     }
@@ -209,8 +214,8 @@ fun AlfredApp(
 @Composable
 private fun AuthenticatedAlfredShell(
     currentUser: FirebaseUser,
-    pendingNavRoute: String?,
-    onConsumeNavRoute: () -> Unit,
+    pendingLaunchAction: AlfredLaunchAction?,
+    onConsumeLaunchAction: () -> Unit,
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -248,8 +253,30 @@ private fun AuthenticatedAlfredShell(
     var hasNotificationPermission by remember {
         mutableStateOf(NotificationChannels.hasNotificationPermission(context))
     }
+    var canScheduleExactAlarms by remember {
+        mutableStateOf(NotificationChannels.canScheduleExactAlarms(context))
+    }
+    var isIgnoringBatteryOptimizations by remember {
+        mutableStateOf(NotificationChannels.isIgnoringBatteryOptimizations(context))
+    }
     var calculatorDraft by remember { mutableStateOf<ManualEntryDraft?>(null) }
     var chatActiveScope by rememberSaveable { mutableStateOf(FinanceScope.PERSONAL) }
+    var pendingAutoVoice by remember { mutableStateOf(false) }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, notificationSettings) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                hasNotificationPermission = NotificationChannels.hasNotificationPermission(context)
+                canScheduleExactAlarms = NotificationChannels.canScheduleExactAlarms(context)
+                isIgnoringBatteryOptimizations = NotificationChannels.isIgnoringBatteryOptimizations(context)
+                SummaryWorkScheduler.syncWork(context.applicationContext, notificationSettings)
+                financeViewModel.resyncNotifications()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     val snackbarHostState = remember { SnackbarHostState() }
 
@@ -267,12 +294,22 @@ private fun AuthenticatedAlfredShell(
         }
     }
 
-    LaunchedEffect(pendingNavRoute) {
-        val target = pendingNavRoute
+    LaunchedEffect(pendingLaunchAction) {
+        val action = pendingLaunchAction ?: return@LaunchedEffect
+        val target = action.route
         if (!target.isNullOrBlank() && NAV_TABS.any { it.route == target }) {
             currentRoute = target
-            onConsumeNavRoute()
         }
+        action.targetScope?.let { chatActiveScope = it }
+        if (action.openQuickAdd) {
+            calculatorDraft = null
+            showCalculatorSheet = true
+        }
+        if (action.autoStartVoice) {
+            currentRoute = ROUTE_ALFRED
+            pendingAutoVoice = true
+        }
+        onConsumeLaunchAction()
     }
 
     LaunchedEffect(
@@ -282,6 +319,10 @@ private fun AuthenticatedAlfredShell(
         notificationSettings.dailySummaryMinute,
     ) {
         SummaryWorkScheduler.syncWork(context.applicationContext, notificationSettings)
+    }
+
+    LaunchedEffect(Unit) {
+        SummaryWorkScheduler.syncWork(context.applicationContext, notificationPrefs.getSettings())
     }
 
     LaunchedEffect(notificationSettings.onboardingPromptShown) {
@@ -409,6 +450,16 @@ private fun AuthenticatedAlfredShell(
                             chatStatus = chatStatus,
                             chatActiveScope = chatActiveScope,
                             onChatScopeChange = { chatActiveScope = it },
+                            voiceRepliesEnabled = notificationSettings.voiceRepliesEnabled,
+                            continuousVoiceEnabled = notificationSettings.continuousVoiceEnabled,
+                            onToggleVoiceReplies = { enabled ->
+                                coroutineScope.launch { notificationPrefs.setVoiceRepliesEnabled(enabled) }
+                            },
+                            onToggleContinuousVoice = { enabled ->
+                                coroutineScope.launch { notificationPrefs.setContinuousVoiceEnabled(enabled) }
+                            },
+                            pendingAutoVoice = pendingAutoVoice,
+                            onConsumeAutoVoice = { pendingAutoVoice = false },
                             onNavigate = { currentRoute = it },
                             onOpenQuickAdd = {
                                 calculatorDraft = null
@@ -420,6 +471,8 @@ private fun AuthenticatedAlfredShell(
                             },
                             onOpenNotificationSettings = {
                                 hasNotificationPermission = NotificationChannels.hasNotificationPermission(context)
+                                canScheduleExactAlarms = NotificationChannels.canScheduleExactAlarms(context)
+                                isIgnoringBatteryOptimizations = NotificationChannels.isIgnoringBatteryOptimizations(context)
                                 showNotificationSettingsSheet = true
                             },
                             onSignOut = { GoogleAuthHelper.signOut(context, coroutineScope) },
@@ -451,6 +504,16 @@ private fun AuthenticatedAlfredShell(
                         chatStatus = chatStatus,
                         chatActiveScope = chatActiveScope,
                         onChatScopeChange = { chatActiveScope = it },
+                        voiceRepliesEnabled = notificationSettings.voiceRepliesEnabled,
+                        continuousVoiceEnabled = notificationSettings.continuousVoiceEnabled,
+                        onToggleVoiceReplies = { enabled ->
+                            coroutineScope.launch { notificationPrefs.setVoiceRepliesEnabled(enabled) }
+                        },
+                        onToggleContinuousVoice = { enabled ->
+                            coroutineScope.launch { notificationPrefs.setContinuousVoiceEnabled(enabled) }
+                        },
+                        pendingAutoVoice = pendingAutoVoice,
+                        onConsumeAutoVoice = { pendingAutoVoice = false },
                         onNavigate = { currentRoute = it },
                         onOpenQuickAdd = {
                             calculatorDraft = null
@@ -462,6 +525,8 @@ private fun AuthenticatedAlfredShell(
                         },
                         onOpenNotificationSettings = {
                             hasNotificationPermission = NotificationChannels.hasNotificationPermission(context)
+                            canScheduleExactAlarms = NotificationChannels.canScheduleExactAlarms(context)
+                            isIgnoringBatteryOptimizations = NotificationChannels.isIgnoringBatteryOptimizations(context)
                             showNotificationSettingsSheet = true
                         },
                         onSignOut = { GoogleAuthHelper.signOut(context, coroutineScope) },
@@ -563,6 +628,8 @@ private fun AuthenticatedAlfredShell(
         NotificationSettingsSheet(
             settings = notificationSettings,
             hasSystemPermission = hasNotificationPermission,
+            canScheduleExactAlarms = canScheduleExactAlarms,
+            isIgnoringBatteryOptimizations = isIgnoringBatteryOptimizations,
             onRequestPermission = {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
                     !NotificationChannels.hasNotificationPermission(context)
@@ -580,6 +647,38 @@ private fun AuthenticatedAlfredShell(
                             context.startActivity(fallback)
                         }
                 }
+            },
+            onRequestExactAlarms = {
+                val intent = NotificationChannels.buildExactAlarmSettingsIntent(context)
+                runCatching { context.startActivity(intent) }
+                    .onFailure {
+                        val fallback = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                            data = Uri.fromParts("package", context.packageName, null)
+                        }
+                        runCatching { context.startActivity(fallback) }
+                    }
+            },
+            onRequestBatteryOptimization = {
+                val intent = if (NotificationChannels.isIgnoringBatteryOptimizations(context)) {
+                    NotificationChannels.buildBatteryOptimizationFallbackIntent()
+                } else {
+                    NotificationChannels.buildBatteryOptimizationIntent(context)
+                }
+                runCatching { context.startActivity(intent) }
+                    .onFailure {
+                        runCatching {
+                            context.startActivity(NotificationChannels.buildBatteryOptimizationFallbackIntent())
+                        }
+                    }
+            },
+            onRequestAddQuickSettingsTile = if (AlfredVoiceTileService.canRequestAddTile()) {
+                {
+                    AlfredVoiceTileService.requestAddTile(context) { feedback ->
+                        coroutineScope.launch { snackbarHostState.showSnackbar(feedback) }
+                    }
+                }
+            } else {
+                null
             },
             onToggleReminders = { enabled ->
                 coroutineScope.launch {
@@ -650,6 +749,12 @@ private fun AlfredScreenHost(
     chatStatus: com.example.ui.viewmodel.ChatStatus,
     chatActiveScope: FinanceScope,
     onChatScopeChange: (FinanceScope) -> Unit,
+    voiceRepliesEnabled: Boolean,
+    continuousVoiceEnabled: Boolean,
+    onToggleVoiceReplies: (Boolean) -> Unit,
+    onToggleContinuousVoice: (Boolean) -> Unit,
+    pendingAutoVoice: Boolean,
+    onConsumeAutoVoice: () -> Unit,
     onNavigate: (String) -> Unit,
     onOpenQuickAdd: () -> Unit,
     onOpenManualEntry: (ManualEntryDraft) -> Unit,
@@ -739,6 +844,12 @@ private fun AlfredScreenHost(
                 chatStatus = chatStatus,
                 activeScope = chatActiveScope,
                 onScopeChange = onChatScopeChange,
+                voiceRepliesEnabled = voiceRepliesEnabled,
+                continuousVoiceEnabled = continuousVoiceEnabled,
+                onToggleVoiceReplies = onToggleVoiceReplies,
+                onToggleContinuousVoice = onToggleContinuousVoice,
+                pendingAutoVoice = pendingAutoVoice,
+                onConsumeAutoVoice = onConsumeAutoVoice,
                 onSendMessage = { text, bmp ->
                     viewModel.sendChatMessage(text, bmp, chatActiveScope)
                 },

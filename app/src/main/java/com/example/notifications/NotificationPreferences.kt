@@ -28,6 +28,8 @@ data class NotificationSettings(
     val lastPhraseIndices: Map<String, Int> = emptyMap(),
     val notifiedGoalMilestones: Map<String, Int> = emptyMap(),
     val onboardingPromptShown: Boolean = false,
+    val voiceRepliesEnabled: Boolean = true,
+    val continuousVoiceEnabled: Boolean = false,
 ) {
     companion object {
         val DEFAULT_NICKNAMES = listOf("chefe", "mestre", "patrão Nascimento", "Nascimento")
@@ -149,6 +151,14 @@ class NotificationPreferences(private val context: Context) {
         context.notificationDataStore.edit { it[KEY_ONBOARDING_PROMPT_SHOWN] = shown }
     }
 
+    suspend fun setVoiceRepliesEnabled(enabled: Boolean) {
+        context.notificationDataStore.edit { it[KEY_VOICE_REPLIES_ENABLED] = enabled }
+    }
+
+    suspend fun setContinuousVoiceEnabled(enabled: Boolean) {
+        context.notificationDataStore.edit { it[KEY_CONTINUOUS_VOICE_ENABLED] = enabled }
+    }
+
     suspend fun getCachedReminderSnapshots(): List<ReminderAlarmSnapshot> {
         val raw = context.notificationDataStore.data.first()[KEY_CACHED_ALARMS_JSON].orEmpty()
         return decodeSnapshots(raw)
@@ -177,6 +187,8 @@ class NotificationPreferences(private val context: Context) {
             lastPhraseIndices = decodeIntMap(prefs[KEY_LAST_PHRASE_INDICES_JSON]),
             notifiedGoalMilestones = decodeIntMap(prefs[KEY_GOAL_MILESTONES_JSON]),
             onboardingPromptShown = prefs[KEY_ONBOARDING_PROMPT_SHOWN] ?: false,
+            voiceRepliesEnabled = prefs[KEY_VOICE_REPLIES_ENABLED] ?: true,
+            continuousVoiceEnabled = prefs[KEY_CONTINUOUS_VOICE_ENABLED] ?: false,
         )
     }
 
@@ -267,5 +279,7 @@ class NotificationPreferences(private val context: Context) {
         val KEY_GOAL_MILESTONES_JSON = stringPreferencesKey("goal_milestones_json")
         val KEY_ONBOARDING_PROMPT_SHOWN = booleanPreferencesKey("onboarding_prompt_shown")
         val KEY_CACHED_ALARMS_JSON = stringPreferencesKey("cached_reminder_alarms_v1")
+        val KEY_VOICE_REPLIES_ENABLED = booleanPreferencesKey("voice_replies_enabled")
+        val KEY_CONTINUOUS_VOICE_ENABLED = booleanPreferencesKey("continuous_voice_enabled")
     }
 }

@@ -107,6 +107,8 @@ data class FinanceReminder(
     val dueAt: Timestamp? = null,
     val recurrence: String = ReminderRecurrence.NONE.wireValue,
     val monthKey: String = "",
+    val anchorDay: Int = 0,
+    val generatedNextId: String = "",
     @get:PropertyName("isCompleted") val isCompleted: Boolean = false,
     @ServerTimestamp val createdAt: Timestamp? = null,
     @ServerTimestamp val updatedAt: Timestamp? = null,
